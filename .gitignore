@@ -1,0 +1,45 @@
+# reference material (read-only, not part of this project)
+_ref/
+.workbuddy/
+
+# runtime artifacts
+traces/
+evals/reports/**/*.json
+!evals/reports/.gitkeep
+
+# secrets
+.env
+
+# python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+
+# editors
+.idea/
+.vscode/
+
+# generated databases
+data/
+*.db
+
+# Local development materials omitted from the release
+AGENTS.md
+TASKS.md
+docs/PLAN.md
+docs/M1_ACCEPTANCE.md
+docs/DECISIONS.md
+docs/RETROSPECTIVE.md
+docs/notes/
+scripts/analyze_p7.py
+evals/reports/*plan*.md
+evals/reports/*analysis*.md
+evals/reports/*pilot*.md
+evals/reports/*.patch
+.env.*
+!.env.example

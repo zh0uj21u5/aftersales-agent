@@ -1,0 +1,46 @@
+id: t047_partial_return_and_new_order
+tags:
+- compound
+- return
+- create
+- amount
+user_profile:
+  phone: '13800000005'
+  name: 用户005
+opening_message: 我是用户005，手机号13800000005。O1005的OI00005只退一件，理由七天无理由，其余两件保留；另外新买S0002一件，不用券，PM0005和默认地址。分别告诉退款和新购实付，先确认。
+instruction: 逐项跟进开场中的全部诉求，不增加新业务请求。等待客服复述具体方案和金额后才同意写操作；不能办理的请求接受规则解释。若有依赖步骤，前一步完成后再确认下一步。客服询问身份时给出登记姓名和手机号。全部完成、明确拒绝或升级后结束。
+scripted_replies:
+- 好的，确认，请按方案办理，不办理其他操作。
+- 好的，确认，请按方案办理，不办理其他操作。
+- 好的，确认，请按方案办理，不办理其他操作。
+- '###STOP###'
+max_turns: 6
+gold_actions:
+- tool: request_return
+  args:
+    order_id: O1005
+    items:
+    - order_item_id: OI00005
+      qty: 1
+    reason: 七天无理由
+- tool: create_order
+  args:
+    user_id: U005
+    items:
+    - sku_id: S0002
+      qty: 1
+    payment_method_id: PM0005
+amount_sources:
+- action_index: 0
+- action_index: 1
+must_mention:
+- '150.00'
+- '110.00'
+must_not:
+- apply_price_protection
+- cancel_order
+- modify_address
+- request_exchange
+- submit_approval
+- transfer_to_human
+expect_handoff: false

@@ -1,0 +1,28 @@
+id: t004_cancel_unpaid
+tags:
+- single
+- cancel
+- boundary
+user_profile:
+  phone: '13800000009'
+  name: 用户009
+opening_message: 我是用户009，手机号13800000009。请取消待支付订单O1009，取消理由记为“暂时不需要”。不要重新下单。
+instruction: 只处理本任务中明确提出的请求；先等待客服复述方案，再同意合法操作；不能办理的请求接受规则解释。不要主动要求额外操作。
+scripted_replies:
+- 好的，确认，就这么办。
+- '###STOP###'
+max_turns: 4
+gold_actions:
+- tool: cancel_order
+  args:
+    order_id: O1009
+    reason: 暂时不需要
+amount_sources: []
+must_mention: []
+must_not:
+- modify_address
+- apply_price_protection
+- request_return
+- request_exchange
+- create_order
+expect_handoff: false

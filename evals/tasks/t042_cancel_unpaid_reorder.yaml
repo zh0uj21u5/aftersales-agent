@@ -1,0 +1,45 @@
+id: t042_cancel_unpaid_reorder
+tags:
+- compound
+- cancel
+- create
+- boundary
+- amount
+- p7_sample
+user_profile:
+  phone: '13800000009'
+  name: 用户009
+opening_message: 我是用户009，手机号13800000009。先取消未支付订单O1009，原因临时不需要；再新买S0002一件，使用PM0009及默认地址，不用券。先说清取消是否退款以及新单实付，分步等我确认。
+instruction: 逐项跟进开场中的全部诉求，不增加新业务请求。等待客服复述具体方案和金额后才同意写操作；不能办理的请求接受规则解释。若有依赖步骤，前一步完成后再确认下一步。客服询问身份时给出登记姓名和手机号。全部完成、明确拒绝或升级后结束。
+scripted_replies:
+- 好的，确认，请按方案办理，不办理其他操作。
+- 好的，确认，请按方案办理，不办理其他操作。
+- 好的，确认，请按方案办理，不办理其他操作。
+- '###STOP###'
+max_turns: 6
+gold_actions:
+- tool: cancel_order
+  args:
+    order_id: O1009
+    reason: 暂时不需要
+- tool: create_order
+  args:
+    user_id: U009
+    items:
+    - sku_id: S0002
+      qty: 1
+    payment_method_id: PM0009
+amount_sources:
+- action_index: 0
+- action_index: 1
+must_mention:
+- '0.00'
+- '110.00'
+must_not:
+- apply_price_protection
+- modify_address
+- request_exchange
+- request_return
+- submit_approval
+- transfer_to_human
+expect_handoff: false

@@ -1,0 +1,31 @@
+id: t009_price_coupon
+tags:
+- single
+- price_protection
+- coupon_math
+- amount
+user_profile:
+  phone: '13800000006'
+  name: 用户006
+opening_message: 我是用户006，手机号13800000006。请对订单O1006商品行OI00006办理一次价保并告知退款金额。仅办理价保，不退货、不取消。
+instruction: 只处理本任务中明确提出的请求；先等待客服复述方案，再同意合法操作；不能办理的请求接受规则解释。不要主动要求额外操作。
+scripted_replies:
+- 好的，确认，就这么办。
+- '###STOP###'
+max_turns: 4
+gold_actions:
+- tool: apply_price_protection
+  args:
+    order_id: O1006
+    order_item_id: OI00006
+amount_sources:
+- action_index: 0
+must_mention:
+- '57.00'
+must_not:
+- modify_address
+- cancel_order
+- request_return
+- request_exchange
+- create_order
+expect_handoff: false

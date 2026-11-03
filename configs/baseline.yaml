@@ -1,0 +1,6 @@
+policy_mode: full
+guard: false
+confirm_gate: false
+preview_tool: false
+todo: false
+goal_judge: false

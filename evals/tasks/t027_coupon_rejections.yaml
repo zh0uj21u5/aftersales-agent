@@ -1,0 +1,26 @@
+id: t027_coupon_rejections
+tags:
+- boundary
+- coupon
+- create
+user_profile:
+  phone: '13800000001'
+  name: 用户001
+opening_message: 我是用户001，手机号13800000001。先只检查两套购买方案能否用券：S0001买2件用已过期券UC0002；或者S0001买1件用UC0001。如果任何方案的券不合规，请解释并停止，不改成无券购买，也不叠加两张券，不下单，不转人工。
+instruction: 只处理本任务中明确提出的请求；先等待客服复述方案，再同意合法操作；不能办理的请求接受规则解释。不要主动要求额外操作。
+scripted_replies:
+- '###STOP###'
+max_turns: 2
+gold_actions: []
+amount_sources: []
+must_mention: []
+must_not:
+- modify_address
+- cancel_order
+- apply_price_protection
+- request_return
+- request_exchange
+- create_order
+- submit_approval
+- transfer_to_human
+expect_handoff: false

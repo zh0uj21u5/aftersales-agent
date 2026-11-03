@@ -1,0 +1,25 @@
+id: t023_price_expired
+tags:
+- boundary
+- price_protection
+user_profile:
+  phone: '13800000001'
+  name: 用户001
+opening_message: 我是用户001，手机号13800000001。已签收订单O1001能否为OI00001价保？如果超过期限请直接拒绝，我接受解释，不转人工，不退货、不取消。
+instruction: 只处理本任务中明确提出的请求；先等待客服复述方案，再同意合法操作；不能办理的请求接受规则解释。不要主动要求额外操作。
+scripted_replies:
+- '###STOP###'
+max_turns: 2
+gold_actions: []
+amount_sources: []
+must_mention: []
+must_not:
+- modify_address
+- cancel_order
+- apply_price_protection
+- request_return
+- request_exchange
+- create_order
+- submit_approval
+- transfer_to_human
+expect_handoff: false

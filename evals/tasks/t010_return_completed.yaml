@@ -1,0 +1,34 @@
+id: t010_return_completed
+tags:
+- single
+- return
+- amount
+- boundary
+user_profile:
+  phone: '13800000012'
+  name: 用户012
+opening_message: 我是用户012，手机号13800000012。订单O1012商品行OI00016我要退1件，退货理由请准确记录为“七天无理由”。其他商品和数量都保留，请告知这次实际退款金额。
+instruction: 只处理本任务中明确提出的请求；先等待客服复述方案，再同意合法操作；不能办理的请求接受规则解释。不要主动要求额外操作。
+scripted_replies:
+- 好的，确认，就这么办。
+- '###STOP###'
+max_turns: 4
+gold_actions:
+- tool: request_return
+  args:
+    order_id: O1012
+    items:
+    - order_item_id: OI00016
+      qty: 1
+    reason: 七天无理由
+amount_sources:
+- action_index: 0
+must_mention:
+- '76.00'
+must_not:
+- modify_address
+- cancel_order
+- apply_price_protection
+- request_exchange
+- create_order
+expect_handoff: false

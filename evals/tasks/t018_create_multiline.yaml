@@ -1,0 +1,37 @@
+id: t018_create_multiline
+tags:
+- single
+- create
+- coupon_math
+- amount
+user_profile:
+  phone: '13800000003'
+  name: 用户003
+opening_message: 我是用户003，手机号13800000003。请新买S0001 1件、S0002 1件，使用我本人的支付方式PM0003和默认收货地址。只使用优惠券UC0005。请先告知实付金额再等我确认下单。
+instruction: 只处理本任务中明确提出的请求；先等待客服复述方案，再同意合法操作；不能办理的请求接受规则解释。不要主动要求额外操作。
+scripted_replies:
+- 好的，确认，就这么办。
+- '###STOP###'
+max_turns: 4
+gold_actions:
+- tool: create_order
+  args:
+    user_id: U003
+    items:
+    - sku_id: S0001
+      qty: 1
+    - sku_id: S0002
+      qty: 1
+    payment_method_id: PM0003
+    user_coupon_id: UC0005
+amount_sources:
+- action_index: 0
+must_mention:
+- '190.00'
+must_not:
+- modify_address
+- cancel_order
+- apply_price_protection
+- request_return
+- request_exchange
+expect_handoff: false

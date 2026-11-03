@@ -1,0 +1,45 @@
+id: t049_cancel_restore_coupon_rebuy
+tags:
+- compound
+- cancel
+- create
+- coupon_math
+- amount
+user_profile:
+  phone: '13800000008'
+  name: 用户008
+opening_message: 我是用户008，手机号13800000008。先取消O1008，原因临时不需要，说明退款和UC0103恢复情况。取消完成后用恢复的UC0103买S0001两件，支付方式PM0008，默认地址，先说明新单实付再确认。
+instruction: 逐项跟进开场中的全部诉求，不增加新业务请求。等待客服复述具体方案和金额后才同意写操作；不能办理的请求接受规则解释。若有依赖步骤，前一步完成后再确认下一步。客服询问身份时给出登记姓名和手机号。全部完成、明确拒绝或升级后结束。
+scripted_replies:
+- 好的，确认，请按方案办理，不办理其他操作。
+- 好的，确认，请按方案办理，不办理其他操作。
+- 好的，确认，请按方案办理，不办理其他操作。
+- '###STOP###'
+max_turns: 6
+gold_actions:
+- tool: cancel_order
+  args:
+    order_id: O1008
+    reason: 暂时不需要
+- tool: create_order
+  args:
+    user_id: U008
+    items:
+    - sku_id: S0001
+      qty: 2
+    payment_method_id: PM0008
+    user_coupon_id: UC0103
+amount_sources:
+- action_index: 0
+- action_index: 1
+must_mention:
+- '380.00'
+- '180.00'
+must_not:
+- apply_price_protection
+- modify_address
+- request_exchange
+- request_return
+- submit_approval
+- transfer_to_human
+expect_handoff: false

@@ -1,0 +1,48 @@
+id: t044_two_line_partial_returns
+tags:
+- compound
+- return
+- coupon_math
+- amount
+- p7_sample
+user_profile:
+  phone: '13800000017'
+  name: 用户017
+opening_message: 我是用户017，手机号13800000017。O1067的OI00117和OI00118各退一件，分别创建两笔退货，理由七天无理由。其他数量和OI00119保留。请分别试算并说明每一笔退款，等我确认后办理。
+instruction: 逐项跟进开场中的全部诉求，不增加新业务请求。等待客服复述具体方案和金额后才同意写操作；不能办理的请求接受规则解释。若有依赖步骤，前一步完成后再确认下一步。客服询问身份时给出登记姓名和手机号。全部完成、明确拒绝或升级后结束。
+scripted_replies:
+- 确认，请分别显示两项退款。
+- 确认，请分别显示两项退款。
+- 确认，请分别显示两项退款。
+- '###STOP###'
+max_turns: 6
+gold_actions:
+- tool: request_return
+  args:
+    order_id: O1067
+    items:
+    - order_item_id: OI00117
+      qty: 1
+    reason: 七天无理由
+- tool: request_return
+  args:
+    order_id: O1067
+    items:
+    - order_item_id: OI00118
+      qty: 1
+    reason: 七天无理由
+amount_sources:
+- action_index: 0
+- action_index: 1
+must_mention:
+- '90.19'
+- '83.32'
+must_not:
+- apply_price_protection
+- cancel_order
+- create_order
+- modify_address
+- request_exchange
+- submit_approval
+- transfer_to_human
+expect_handoff: false

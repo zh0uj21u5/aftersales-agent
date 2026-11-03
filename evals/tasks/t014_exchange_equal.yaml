@@ -1,0 +1,30 @@
+id: t014_exchange_equal
+tags:
+- single
+- exchange
+- boundary
+user_profile:
+  phone: '13800000012'
+  name: 用户012
+opening_message: 我是用户012，手机号13800000012。请把订单O1012商品行OI00016尚未退回的全部商品换成S0052，原因请准确记录为“更换颜色”。只换货，不退货或价保；如有差价请说明。
+instruction: 只处理本任务中明确提出的请求；先等待客服复述方案，再同意合法操作；不能办理的请求接受规则解释。不要主动要求额外操作。
+scripted_replies:
+- 好的，确认，就这么办。
+- '###STOP###'
+max_turns: 4
+gold_actions:
+- tool: request_exchange
+  args:
+    order_id: O1012
+    order_item_id: OI00016
+    new_sku_id: S0052
+    reason: 更换颜色
+amount_sources: []
+must_mention: []
+must_not:
+- modify_address
+- cancel_order
+- apply_price_protection
+- request_return
+- create_order
+expect_handoff: false

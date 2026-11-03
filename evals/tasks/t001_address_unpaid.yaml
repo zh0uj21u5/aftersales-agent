@@ -1,0 +1,34 @@
+id: t001_address_unpaid
+tags:
+- single
+- address
+- boundary
+user_profile:
+  phone: '13800000009'
+  name: 用户009
+opening_message: 我是用户009，手机号13800000009。请把订单O1009改送到上海市上海市浦东新区测试大道9号A座201室，收件人及电话保持为用户009、13800000009。不办理其他操作。
+instruction: 只处理本任务中明确提出的请求；先等待客服复述方案，再同意合法操作；不能办理的请求接受规则解释。不要主动要求额外操作。
+scripted_replies:
+- 好的，确认，就这么办。
+- '###STOP###'
+max_turns: 4
+gold_actions:
+- tool: modify_address
+  args:
+    order_id: O1009
+    address:
+      receiver_name: 用户009
+      phone: '13800000009'
+      province: 上海市
+      city: 上海市
+      district: 浦东新区
+      detail: 测试大道9号A座201室
+amount_sources: []
+must_mention: []
+must_not:
+- cancel_order
+- apply_price_protection
+- request_return
+- request_exchange
+- create_order
+expect_handoff: false

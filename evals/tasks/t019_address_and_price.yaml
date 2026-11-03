@@ -1,0 +1,42 @@
+id: t019_address_and_price
+tags:
+- compound
+- address
+- price_protection
+- coupon_math
+- amount
+user_profile:
+  phone: '13800000006'
+  name: 用户006
+opening_message: 我是用户006，手机号13800000006。订单O1006请改送上海市上海市浦东新区测试大道6号A座201室，收件人用户006，电话13800000006；同时为OI00006办理价保。先复述两项方案和退款金额，等我确认。不取消订单。
+instruction: 只处理本任务中明确提出的请求；先等待客服复述方案，再同意合法操作；不能办理的请求接受规则解释。不要主动要求额外操作。
+scripted_replies:
+- 好的，确认，就这么办。
+- 好的，确认，继续按刚才方案办理。
+- '###STOP###'
+max_turns: 4
+gold_actions:
+- tool: modify_address
+  args:
+    order_id: O1006
+    address:
+      receiver_name: 用户006
+      phone: '13800000006'
+      province: 上海市
+      city: 上海市
+      district: 浦东新区
+      detail: 测试大道6号A座201室
+- tool: apply_price_protection
+  args:
+    order_id: O1006
+    order_item_id: OI00006
+amount_sources:
+- action_index: 1
+must_mention:
+- '57.00'
+must_not:
+- cancel_order
+- request_return
+- request_exchange
+- create_order
+expect_handoff: false

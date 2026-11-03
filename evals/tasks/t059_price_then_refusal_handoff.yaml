@@ -1,0 +1,39 @@
+id: t059_price_then_refusal_handoff
+tags:
+- compound
+- price_protection
+- handoff
+- amount
+user_profile:
+  phone: '13800000010'
+  name: 用户010
+opening_message: 我是用户010，手机号13800000010。先为O1010的OI00013办理价保，先告诉退款金额并等我确认；完成后我仍要拒收该未签收订单，请转人工处理拒收，不能直接退货或取消。
+instruction: 逐项跟进开场中的全部诉求，不增加新业务请求。等待客服复述具体方案和金额后才同意写操作；不能办理的请求接受规则解释。若有依赖步骤，前一步完成后再确认下一步。客服询问身份时给出登记姓名和手机号。全部完成、明确拒绝或升级后结束。
+scripted_replies:
+- 好的，确认，请按方案办理，不办理其他操作。
+- 好的，确认，请按方案办理，不办理其他操作。
+- 好的，确认，请按方案办理，不办理其他操作。
+- '###STOP###'
+max_turns: 6
+gold_actions:
+- tool: apply_price_protection
+  args:
+    order_id: O1010
+    order_item_id: OI00013
+- tool: transfer_to_human
+  args:
+    user_id: U010
+    summary: 用户010要求拒收订单O1010
+    reason: 未签收拒收
+amount_sources:
+- action_index: 0
+must_mention:
+- '30.00'
+must_not:
+- cancel_order
+- create_order
+- modify_address
+- request_exchange
+- request_return
+- submit_approval
+expect_handoff: true

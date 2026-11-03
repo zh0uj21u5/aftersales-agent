@@ -1,0 +1,43 @@
+id: t046_price_return_balance
+tags:
+- compound
+- price_protection
+- return
+- amount
+user_profile:
+  phone: '13800000002'
+  name: 用户002
+opening_message: 我是用户002，手机号13800000002。O1002先对OI00002价保，然后退该行一件，理由价保后退货。每步先说明退款并等我确认，已退价差不可再退。
+instruction: 逐项跟进开场中的全部诉求，不增加新业务请求。等待客服复述具体方案和金额后才同意写操作；不能办理的请求接受规则解释。若有依赖步骤，前一步完成后再确认下一步。客服询问身份时给出登记姓名和手机号。全部完成、明确拒绝或升级后结束。
+scripted_replies:
+- 好的，确认，请按方案办理，不办理其他操作。
+- 好的，确认，请按方案办理，不办理其他操作。
+- 好的，确认，请按方案办理，不办理其他操作。
+- '###STOP###'
+max_turns: 6
+gold_actions:
+- tool: apply_price_protection
+  args:
+    order_id: O1002
+    order_item_id: OI00002
+- tool: request_return
+  args:
+    order_id: O1002
+    items:
+    - order_item_id: OI00002
+      qty: 1
+    reason: 价保后退货
+amount_sources:
+- action_index: 0
+- action_index: 1
+must_mention:
+- '30.00'
+- '100.00'
+must_not:
+- cancel_order
+- create_order
+- modify_address
+- request_exchange
+- submit_approval
+- transfer_to_human
+expect_handoff: false

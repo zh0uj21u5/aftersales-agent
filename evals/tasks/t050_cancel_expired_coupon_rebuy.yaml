@@ -1,0 +1,45 @@
+id: t050_cancel_expired_coupon_rebuy
+tags:
+- compound
+- cancel
+- create
+- coupon_math
+- boundary
+- amount
+user_profile:
+  phone: '13800000007'
+  name: 用户007
+opening_message: 我是用户007，手机号13800000007。先取消O1007，原因临时不需要，说明退款及已过期券UC0102的状态。然后新买S0001一件，明确不用任何券，用PM0007及默认地址。每步先说明金额等确认。
+instruction: 逐项跟进开场中的全部诉求，不增加新业务请求。等待客服复述具体方案和金额后才同意写操作；不能办理的请求接受规则解释。若有依赖步骤，前一步完成后再确认下一步。客服询问身份时给出登记姓名和手机号。全部完成、明确拒绝或升级后结束。
+scripted_replies:
+- 好的，确认，请按方案办理，不办理其他操作。
+- 好的，确认，请按方案办理，不办理其他操作。
+- 好的，确认，请按方案办理，不办理其他操作。
+- '###STOP###'
+max_turns: 6
+gold_actions:
+- tool: cancel_order
+  args:
+    order_id: O1007
+    reason: 暂时不需要
+- tool: create_order
+  args:
+    user_id: U007
+    items:
+    - sku_id: S0001
+      qty: 1
+    payment_method_id: PM0007
+amount_sources:
+- action_index: 0
+- action_index: 1
+must_mention:
+- '380.00'
+- '100.00'
+must_not:
+- apply_price_protection
+- modify_address
+- request_exchange
+- request_return
+- submit_approval
+- transfer_to_human
+expect_handoff: false

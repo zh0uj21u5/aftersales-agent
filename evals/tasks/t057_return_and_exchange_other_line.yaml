@@ -1,0 +1,46 @@
+id: t057_return_and_exchange_other_line
+tags:
+- compound
+- return
+- exchange
+- coupon_math
+- amount
+user_profile:
+  phone: '13800000017'
+  name: 用户017
+opening_message: 我是用户017，手机号13800000017。O1067的OI00117退一件，理由七天无理由；同单OI00118尚未退回的全部商品换成S0053，原因更换颜色。OI00119不动，分别说明两笔退款，先等确认。
+instruction: 逐项跟进开场中的全部诉求，不增加新业务请求。等待客服复述具体方案和金额后才同意写操作；不能办理的请求接受规则解释。若有依赖步骤，前一步完成后再确认下一步。客服询问身份时给出登记姓名和手机号。全部完成、明确拒绝或升级后结束。
+scripted_replies:
+- 好的，确认，请按方案办理，不办理其他操作。
+- 好的，确认，请按方案办理，不办理其他操作。
+- 好的，确认，请按方案办理，不办理其他操作。
+- '###STOP###'
+max_turns: 6
+gold_actions:
+- tool: request_return
+  args:
+    order_id: O1067
+    items:
+    - order_item_id: OI00117
+      qty: 1
+    reason: 七天无理由
+- tool: request_exchange
+  args:
+    order_id: O1067
+    order_item_id: OI00118
+    new_sku_id: S0053
+    reason: 更换颜色
+amount_sources:
+- action_index: 0
+- action_index: 1
+must_mention:
+- '90.19'
+- '117.63'
+must_not:
+- apply_price_protection
+- cancel_order
+- create_order
+- modify_address
+- submit_approval
+- transfer_to_human
+expect_handoff: false

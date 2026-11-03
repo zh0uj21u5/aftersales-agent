@@ -1,0 +1,38 @@
+id: t028_large_return_approval
+tags:
+- boundary
+- approval
+- return
+user_profile:
+  phone: '13800000005'
+  name: 用户005
+opening_message: 我是用户005，手机号13800000005。订单O1005的OI00005全部3件想退，理由“七天无理由”。超过售后退款审批门槛就只提交审批，不直接退款。审批事由请原样记录为“单笔售后退款超过200元”，审批参数请完整保留订单号、退货商品行、数量3、退货理由“七天无理由”。
+instruction: 只处理本任务中明确提出的请求；先等待客服复述方案，再同意合法操作；不能办理的请求接受规则解释。不要主动要求额外操作。
+scripted_replies:
+- 好的，确认，就这么办。
+- 好的，确认，继续按刚才方案办理。
+- '###STOP###'
+max_turns: 4
+gold_actions:
+- tool: submit_approval
+  args:
+    order_id: O1005
+    action: request_return
+    args:
+      order_id: O1005
+      items:
+      - order_item_id: OI00005
+        qty: 3
+      reason: 七天无理由
+    reason: 单笔售后退款超过200元
+amount_sources: []
+must_mention: []
+must_not:
+- modify_address
+- cancel_order
+- apply_price_protection
+- request_return
+- request_exchange
+- create_order
+- transfer_to_human
+expect_handoff: true

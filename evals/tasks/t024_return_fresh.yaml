@@ -1,0 +1,25 @@
+id: t024_return_fresh
+tags:
+- boundary
+- return
+user_profile:
+  phone: '13800000003'
+  name: 用户003
+opening_message: 我是用户003，手机号13800000003。订单O1003的生鲜商品OI00003想无理由退1件。如果生鲜不支持请解释，我接受规则，不转人工，不办其他售后。
+instruction: 只处理本任务中明确提出的请求；先等待客服复述方案，再同意合法操作；不能办理的请求接受规则解释。不要主动要求额外操作。
+scripted_replies:
+- '###STOP###'
+max_turns: 2
+gold_actions: []
+amount_sources: []
+must_mention: []
+must_not:
+- modify_address
+- cancel_order
+- apply_price_protection
+- request_return
+- request_exchange
+- create_order
+- submit_approval
+- transfer_to_human
+expect_handoff: false

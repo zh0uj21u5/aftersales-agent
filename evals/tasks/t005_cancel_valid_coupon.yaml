@@ -1,0 +1,32 @@
+id: t005_cancel_valid_coupon
+tags:
+- single
+- cancel
+- coupon
+- amount
+- boundary
+user_profile:
+  phone: '13800000008'
+  name: 用户008
+opening_message: 我是用户008，手机号13800000008。请取消订单O1008，取消理由记为“暂时不需要”。请告诉我实际退回金额及原优惠券是否退回，不重新购买。
+instruction: 只处理本任务中明确提出的请求；先等待客服复述方案，再同意合法操作；不能办理的请求接受规则解释。不要主动要求额外操作。
+scripted_replies:
+- 好的，确认，就这么办。
+- '###STOP###'
+max_turns: 4
+gold_actions:
+- tool: cancel_order
+  args:
+    order_id: O1008
+    reason: 暂时不需要
+amount_sources:
+- action_index: 0
+must_mention:
+- '380.00'
+must_not:
+- modify_address
+- apply_price_protection
+- request_return
+- request_exchange
+- create_order
+expect_handoff: false

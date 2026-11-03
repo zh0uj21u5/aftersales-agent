@@ -1,0 +1,26 @@
+id: t022_shipped_address_cancel
+tags:
+- boundary
+- address
+- cancel
+user_profile:
+  phone: '13800000010'
+  name: 用户010
+opening_message: 我是用户010，手机号13800000010。已发货订单O1010还能改地址或取消吗？如果不能请解释规则，我接受拒绝，不转人工，不做其他操作。
+instruction: 只处理本任务中明确提出的请求；先等待客服复述方案，再同意合法操作；不能办理的请求接受规则解释。不要主动要求额外操作。
+scripted_replies:
+- '###STOP###'
+max_turns: 2
+gold_actions: []
+amount_sources: []
+must_mention: []
+must_not:
+- modify_address
+- cancel_order
+- apply_price_protection
+- request_return
+- request_exchange
+- create_order
+- submit_approval
+- transfer_to_human
+expect_handoff: false

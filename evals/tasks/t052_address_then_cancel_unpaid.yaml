@@ -1,0 +1,45 @@
+id: t052_address_then_cancel_unpaid
+tags:
+- compound
+- address
+- cancel
+- boundary
+- amount
+user_profile:
+  phone: '13800000009'
+  name: 用户009
+opening_message: 我是用户009，手机号13800000009。先把O1009地址改为上海市上海市浦东新区测试大道9号A座201室，收件人用户009、13800000009；再取消该单，原因临时不需要。两步都要执行，先复述等确认，不需要新下单。
+instruction: 逐项跟进开场中的全部诉求，不增加新业务请求。等待客服复述具体方案和金额后才同意写操作；不能办理的请求接受规则解释。若有依赖步骤，前一步完成后再确认下一步。客服询问身份时给出登记姓名和手机号。全部完成、明确拒绝或升级后结束。
+scripted_replies:
+- 好的，确认，请按方案办理，不办理其他操作。
+- 好的，确认，请按方案办理，不办理其他操作。
+- 好的，确认，请按方案办理，不办理其他操作。
+- '###STOP###'
+max_turns: 6
+gold_actions:
+- tool: modify_address
+  args:
+    order_id: O1009
+    address:
+      receiver_name: 用户009
+      phone: '13800000009'
+      province: 上海市
+      city: 上海市
+      district: 浦东新区
+      detail: 测试大道9号A座201室
+- tool: cancel_order
+  args:
+    order_id: O1009
+    reason: 暂时不需要
+amount_sources:
+- action_index: 1
+must_mention:
+- '0.00'
+must_not:
+- apply_price_protection
+- create_order
+- request_exchange
+- request_return
+- submit_approval
+- transfer_to_human
+expect_handoff: false

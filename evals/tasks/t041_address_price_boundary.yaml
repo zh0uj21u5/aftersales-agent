@@ -1,0 +1,45 @@
+id: t041_address_price_boundary
+tags:
+- compound
+- address
+- price_protection
+- amount
+- p7_sample
+user_profile:
+  phone: '13800000006'
+  name: 用户006
+opening_message: 我是用户006，手机号13800000006。请把O1006改送上海市上海市浦东新区金科路88号B座301室，收件人用户006，电话13800000006；同时给OI00006办理价保，分别说明两项结果及退差金额。不取消订单，先等我确认。
+instruction: 逐项跟进开场中的全部诉求，不增加新业务请求。等待客服复述具体方案和金额后才同意写操作；不能办理的请求接受规则解释。若有依赖步骤，前一步完成后再确认下一步。客服询问身份时给出登记姓名和手机号。全部完成、明确拒绝或升级后结束。
+scripted_replies:
+- 好的，确认办理，不取消订单。
+- 好的，确认办理，不取消订单。
+- 好的，确认办理，不取消订单。
+- '###STOP###'
+max_turns: 6
+gold_actions:
+- tool: modify_address
+  args:
+    order_id: O1006
+    address:
+      receiver_name: 用户006
+      phone: '13800000006'
+      province: 上海市
+      city: 上海市
+      district: 浦东新区
+      detail: 金科路88号B座301室
+- tool: apply_price_protection
+  args:
+    order_id: O1006
+    order_item_id: OI00006
+amount_sources:
+- action_index: 1
+must_mention:
+- '57.00'
+must_not:
+- cancel_order
+- create_order
+- request_exchange
+- request_return
+- submit_approval
+- transfer_to_human
+expect_handoff: false

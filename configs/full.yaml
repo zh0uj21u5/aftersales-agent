@@ -1,0 +1,6 @@
+policy_mode: on_demand
+guard: true
+confirm_gate: true
+preview_tool: true
+todo: true
+goal_judge: true
