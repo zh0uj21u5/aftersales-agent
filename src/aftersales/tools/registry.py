@@ -1,5 +1,7 @@
 """Typed tool metadata, schema generation, validation, and execution."""
 
+from __future__ import annotations
+
 import inspect
 import json
 import sqlite3
@@ -15,19 +17,28 @@ from aftersales.domain.services import PolicyError, Services
 
 if TYPE_CHECKING:
     from aftersales.core.context import TodoItem
+    from aftersales.core.llm import Message
+    from aftersales.policy.proposal import ActionProposal, ProposedAction
 
 TOOL_OUTPUT_MAX_CHARS = 8000
 
 
 class SessionState(Protocol):
-    todo: list["TodoItem"]
+    session_id: str
+    proposals: list[ActionProposal]
+    presented_proposal_version: int | None
+    messages: list[Message]
+    todo: list[TodoItem]
     authenticated_user_id: str | None
+    closed: bool
     confirmation_user_index: int
     confirmation_available: bool
     confirmation_checked: bool
     confirmation_identity: str | None
     confirmation_proposal: str
     confirmed_batch: bool
+
+    def persist(self) -> None: ...
 
 
 class ClockSource(Protocol):
@@ -41,6 +52,9 @@ class ToolContext:
     db: sqlite3.Connection | None = None
     clock: ClockSource | None = None
     execution_id: str | None = None
+    authorized_action: ProposedAction | None = None
+    tool_call_id: str | None = None
+    result_checkpointed: bool = False
 
     def services(self) -> Services:
         if self.db is None or self.clock is None:
@@ -61,6 +75,19 @@ class ToolResult(BaseModel):
     is_error: bool = False
     rule_ids: list[str] = Field(default_factory=list)
     source: str | None = None
+
+
+def tool_result_message(call_id: str, result: ToolResult) -> Message:
+    """Use identical untrusted-data quoting in live and committed tool replies."""
+    from aftersales.core.llm import Message
+
+    quoted = json.dumps(result.content, ensure_ascii=False).replace("<", "\\u003c")
+    return Message(
+        role="tool",
+        tool_call_id=call_id,
+        is_error=result.is_error,
+        content=f"<tool_result>{quoted}</tool_result>",
+    )
 
 
 @dataclass(frozen=True)
@@ -144,7 +171,20 @@ class ToolRegistry:
             )
         try:
             kwargs = {key: getattr(validated, key) for key in type(validated).model_fields}
-            value = entry.function(ctx, **kwargs)
+            if ctx.authorized_action is not None and entry.spec.permission == "write":
+                from aftersales.core.execution import execute_action
+
+                proposal = ctx.session.proposals[-1]
+                value = execute_action(
+                    ctx,
+                    proposal.proposal_id,
+                    ctx.authorized_action.action_id,
+                    proposal.version,
+                    name,
+                    arguments,
+                )
+            else:
+                value = entry.function(ctx, **kwargs)
             if isinstance(value, ToolResult):
                 result = value.model_copy(deep=True)
             else:

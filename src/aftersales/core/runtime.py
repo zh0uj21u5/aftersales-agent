@@ -10,6 +10,7 @@ from aftersales.core.goal_judge import GoalJudge
 from aftersales.core.hooks import PolicyHooks
 from aftersales.core.llm import LLMClient
 from aftersales.core.loop import Agent
+from aftersales.core.session_store import SessionStore
 from aftersales.core.tracing import TracedClient, TraceWriter
 from aftersales.domain.clock import Clock
 from aftersales.policy.document import policy_text
@@ -67,4 +68,5 @@ def build_agent(
         system=lambda: build_system(clock, config.policy_mode),
         trace=trace,
         goal_judge=completion_judge,
+        session_store=SessionStore(db, clock),
     )

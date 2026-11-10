@@ -2,6 +2,7 @@
 
 import json
 import re
+from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -86,6 +87,19 @@ def with_todo(system: str, items: list[TodoItem], enabled: bool) -> str:
     )
 
 
+def with_proposal_contract(system: str, enabled: bool) -> str:
+    if not enabled:
+        return system
+    # Replace the legacy batch contract without changing frozen prompts in old configurations.
+    system = re.sub(r"(?m)^所有写操作前必须[^\n]*\n用户同意后[^\n]*\n", "", system)
+    system = system.replace(
+        "一次确认仅用于同一次模型响应中的一批写操作，首个获准写操作消费确认，下一批需再次征求确认。",
+        "当前使用结构化 Proposal 合同：整份同意只授权该版本的明确动作，每项成功后单次消费。",
+    )
+    contract = Path(__file__).parents[1] / "prompts" / "proposal.md"
+    return system + "\n\n" + contract.read_text(encoding="utf-8")
+
+
 class ContextView(BaseModel):
     messages: list[Message]
     compressed_indices: list[int] = Field(default_factory=list)
@@ -124,7 +138,11 @@ def prepare_messages(
             continue  # Ambiguous or orphan results are kept intact.
         name = names[0]
         entry = registry.get(name)
-        if name in AUTH_TOOLS or entry is None or entry.spec.permission != "read":
+        if (
+            name in AUTH_TOOLS | {"propose_actions"}
+            or entry is None
+            or entry.spec.permission != "read"
+        ):
             continue
         quoted = json.dumps(
             f"历史只读工具 {name} 的结果已压缩；需要细节请重新查询。", ensure_ascii=False

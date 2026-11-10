@@ -1,6 +1,6 @@
 # 系统架构 · v1.0
 
-本文描述已实现的P7-B及P8发布形态，历史实验版本以[RESULTS](RESULTS.md)的哈希为准。实现只使用Python3.11、已有SDK/Pydantic与标准库SQLite，不引入Agent编排框架。[PRD](PRD.md)定义范围，ADR（本地开发记录，未随发布上传）记录取舍。
+本文描述 v2.0.0 的实现及 v1.0 基线，历史实验版本以[RESULTS](RESULTS.md)的哈希为准。实现只使用Python3.11、已有SDK/Pydantic与标准库SQLite，不引入Agent编排框架。[PRD](PRD.md)定义产品范围。
 
 ## 分层与依赖
 
@@ -65,7 +65,7 @@ max_tokens使整批调用不执行，恢复提示只消费一次；连续第三�
 
 确认状态在Session：最近用户前紧邻的assistant须为无tool_calls文本；heuristic或独立小模型判同意；直接否定优先。一个新用户输入只初始化一次，read不消耗；首个获准write消费，当前模型响应中的其余write可继续，但逐项业务校验；下一before_llm清除confirmed_batch，不能从同一用户句子重新授予同意。参数/Guard拒绝不消耗，服务执行失败已消耗；身份变化使许可失效。
 
-P7-B仅豁免有限完整边界分句，仍需肯定词；“不取消订单”即使伴随确认也明确拒绝cancel_order。它不是通用语义授权器，也没有将方案和工具参数逐字段签名绑定。escalate不等同write：审批和人工记录不退款，无P02写门，但仍受资源访问校验。
+v1.0兼容确认门（proposal_gate=False）在P7-B仅豁免有限完整边界分句，仍需肯定词；“不取消订单”即使伴随确认也明确拒绝cancel_order。它不是通用语义授权器，也没有将方案和工具参数逐字段签名绑定。escalate不等同write：审批和人工记录不退款，无P02写门，但仍受资源访问校验。
 
 未认证只允许认证、规则查阅、匿名转人工与内部update_todo；其他真实查询仍需身份。用户/订单参数均校验归属。认证前转人工允许handoffs.user_id=NULL，可能与期望关联用户的评测不一致，不能悄悄改grader修正它。
 
@@ -111,4 +111,30 @@ Agent、确认分类与GoalJudge计Agent目的用量；模拟器用purpose=simul
 
 wheel包含aftersales、evals及SQL/Markdown/YAML资源，排除运行报告。配置、测试与演示脚本从源码仓库使用；CLI默认tasks/config相对当前目录，因此快速上手要求位于仓库根。独立wheel导入与包内资源另做验证。业务时钟固定不影响perf_counter性能计时；trace运行ID用UUID防止固定时间冲突。
 
-默认离线演示真实调用build_agent、PolicyHooks、Services与SQLite，Mock只替换模型；不经.env、不连模型。M4真实链路只用授权的1个chat+5个scripted trial，记录费用、耗时和实际结果；不把演示当成功率实验。后续生产所需的真实鉴权、支付幂等、并发控制、审批工作台与账户隔离留给v2。
+默认离线演示真实调用build_agent、PolicyHooks、Services与SQLite，Mock只替换模型；不经.env、不连模型。M4真实链路只用授权的1个chat+5个scripted trial，记录费用、耗时和实际结果；不把演示当成功率实验。M5～M7后续补充了本地Proposal绑定授权、SQLite动作幂等与审计工作台；生产鉴权、外部支付幂等和多租户账户隔离仍待后续设计。
+
+## M5～M7 增量：绑定授权、恢复与双栏审计工作台
+
+当 `confirm_gate=True, proposal_gate=True` 时，模型先调用 `propose_actions`，服务端用写工具相同的严格Schema及Services.check_*生成ActionProposal。仅最新pending版本可整份批准；部分同意或修改先拒绝旧方案，再生成v+1重新确认。写入前匹配tool_name和全部结构化canonical_args（reason仅非空）、复核业务前提与试算金额。旧版确认门仍通过proposal_gate=False可复现；取消退券后重拍须分步提案，不在内存模拟依赖写入。
+
+`execute_action` 用 `(session_id, proposal_id, action_id)` 唯一键，在同一SQLite事务内提交业务变更、before/after快照、OperationResult、Session及授权消费；同键同参读取原结果，同键异参P02。事务不跨LLM请求。Session完整JSON以revision检测过期更新，CLI与Web可恢复；JSONL trace通过session_traces关联。实现见 [Proposal](../src/aftersales/policy/proposal.py)、[动作执行](../src/aftersales/core/execution.py)与[会话存储](../src/aftersales/core/session_store.py)。
+
+原生前端由 `web/app.py` 的 `GET /` 与 `/static` 托管，Hatch wheel 显式打包，无前端构建依赖。左栏通过 sessions/messages/decision 操作统一 Agent 与授权入口，服务端返回订单快照、审批记录、多版本方案、执行记录和关联Trace。前端不判断业务资格、不计算退款，仅把整数分格式化显示。
+
+```mermaid
+flowchart LR
+    UI[买家对话 / 确认卡] --> API[FastAPI 薄API]
+    API --> Loop[Agent / Hooks / Proposal]
+    Loop --> Exec[execute_action]
+    Exec --> DB[(业务行 + Session + action_executions)]
+    DB --> Live[实时审计: 三方绑定 / Before-After]
+    Loop --> Trace[JSONL Trace]
+    Trace --> Live
+    Reports[eval报告: Gold双库判分] --> Replay[评测Tab: 指标与终态差异]
+```
+
+新增 `POST /api/demos/{1|2|3}` 在原库相邻的 `<db-stem>-demos/<session_id>.db` 创建独立seed库；`POST /api/sessions/{id}/demo/advance` 按持久化游标执行下一步。只接受场景1～3和严格生成的会话路径，刷新/重启按会话ID恢复同一演示库。剧本使用MockLLM，但调用真实Agent、确认门、Services与执行事务；没有API Token消耗。仅演示游标新增辅助表，14业务表与旧种子/评分schema保持冻结。
+
+实时三方表只把同一Proposal动作与相应执行记录连接，未提交的尝试保留在Trace；字段Diff来自action_executions原始快照，不从模型回复推测。评测Tab只显示报告中的grade.database_diff（Agent缺失Gold行/多余行），终态一致时明确显示空差异。任务完成度、业务正确性和代码拦截是不同证据，不在UI里混为同一“安全率”。
+
+`serve --offline` 注入本地说明型客户端且不读.env；普通serve注入当前配置模型，确认卡API始终开启guard、confirm_gate、proposal_gate。全部自由文本只用DOM文本节点渲染。浏览器session_id仍是本地凭据，未扩展为互联网多租户服务。

@@ -15,6 +15,7 @@ from aftersales.domain.models import (
     UserDetails,
 )
 from aftersales.policy.document import PolicyTopic, lookup_topic
+from aftersales.policy.proposal import ActionRequest, ProposalResult, create_proposal
 from aftersales.tools.registry import ToolContext, tool
 
 
@@ -59,6 +60,10 @@ def list_user_coupons(
 @tool(name="lookup_policy", policy_topics=["security"])
 def lookup_policy(ctx: ToolContext, topic: PolicyTopic) -> str:
     """Read all policy sections belonging to the requested topic."""
+    if topic == "confirm" and ctx.config.confirm_gate and ctx.config.proposal_gate:
+        from aftersales.core.context import with_proposal_contract
+
+        return with_proposal_contract(lookup_topic(topic), True)
     return lookup_topic(topic)
 
 
@@ -79,3 +84,15 @@ def preview_refund(
 ) -> RefundPreview:
     """Preview a refund or exchange top-up and policy violations without writing data."""
     return ctx.services().preview_refund(order_id, action, order_item_id, qty, new_sku_id)
+
+
+@tool(name="propose_actions", permission="read", policy_topics=["confirm", "approval"])
+def propose_actions(ctx: ToolContext, actions: list[ActionRequest]) -> ProposalResult:
+    """Validate independent write actions and preview exact cents; save a whole-plan session proposal.
+
+    Each action supplies tool_name and arguments matching that write tool's schema.
+    Present the returned canonical arguments and amounts now, then wait for whole-plan consent.
+    Partial consent or edits require a new proposal and fresh confirmation. P08 candidates
+    require submit_approval instead of direct execution. Dependent operations need separate plans.
+    """
+    return create_proposal(ctx, actions)

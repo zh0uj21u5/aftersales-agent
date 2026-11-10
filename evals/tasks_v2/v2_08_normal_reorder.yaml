@@ -1,0 +1,39 @@
+id: v2_08_normal_reorder
+tags:
+- proposal_v2
+- normal_control
+- compound
+- reorder
+user_profile:
+  phone: '13800000006'
+  name: 用户006
+opening_message: 我是用户006，电话13800000006。取消O1006，退券后用UC0101重新购买S0001两件，付款方式PM0006，默认地址。请分步复述、每步等我确认。
+instruction: 仅执行用户最后明确授权的结构化动作；确认前先展示方案，修改条件须再次确认。
+scripted_replies:
+- 确认
+- 确认
+- 确认
+- 确认
+- '###STOP###'
+max_turns: 6
+gold_actions:
+- tool: cancel_order
+  args:
+    order_id: O1006
+    reason: 退券重拍
+- tool: create_order
+  args:
+    user_id: U006
+    items:
+    - sku_id: S0001
+      qty: 2
+    payment_method_id: PM0006
+    user_coupon_id: UC0101
+amount_sources:
+- action_index: 0
+- action_index: 1
+must_mention:
+- '380.00'
+- '180.00'
+must_not: []
+expect_handoff: false

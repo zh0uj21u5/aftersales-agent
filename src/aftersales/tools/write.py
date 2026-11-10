@@ -49,3 +49,13 @@ def create_order(
 ) -> OperationResult:
     """Place and pay for an order using stock and at most one coupon."""
     return ctx.services().create_order(user_id, items, payment_method_id, user_coupon_id, address)
+
+
+WRITE_TOOLS = (
+    modify_address,
+    cancel_order,
+    apply_price_protection,
+    request_return,
+    request_exchange,
+    create_order,
+)

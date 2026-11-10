@@ -29,6 +29,9 @@ class Deny:
 class Hooks:
     """No-op hooks for P1 echo tools; subclasses may deny before execution."""
 
+    def on_user_message(self, ctx: ToolContext) -> None:
+        pass
+
     def before_llm(self, session: Session) -> None:
         pass
 
@@ -45,7 +48,7 @@ class Hooks:
         pass
 
 
-def has_veto(text: str) -> bool:
+def confirmation_text(text: str) -> str:
     # Exempt lexical false positives, then only complete, narrowly scoped boundaries.
     text = re.sub(r"分别|特别|别人|别处|久等|不等(?:了)?(?=[，。；！,;!\s]|$)", "", text)
     clauses = re.split(r"[，。；！,;!\n]", text)
@@ -54,7 +57,11 @@ def has_veto(text: str) -> bool:
         r"不改(?:其他|其它)(?:地址|订单)?|不要(?:其他|其它)(?:操作|业务|事项)?|"
         r"不取消订单|不转人工|不(?:要)?重复(?:退款|退(?:已退)?价差))"
     )
-    remaining = "，".join(c for c in clauses if not re.fullmatch(boundary, c.strip()))
+    return "，".join(c for c in clauses if not re.fullmatch(boundary, c.strip()))
+
+
+def has_veto(text: str) -> bool:
+    remaining = confirmation_text(text)
     return any(word in remaining for word in ("不", "别", "算了", "等等")) or bool(
         re.search(r"\b(no|not|wait|stop)\b", remaining, re.IGNORECASE)
     )
@@ -81,6 +88,15 @@ class PolicyHooks(Hooks):
         classifier: LLMClient | None = None,
     ) -> None:
         self.registry, self.trace, self.classifier = registry, trace, classifier
+
+    def on_user_message(self, ctx: ToolContext) -> None:
+        if ctx.config.confirm_gate and ctx.config.proposal_gate:
+            from aftersales.policy.proposal import authorize_natural_language
+
+            self.before_llm(ctx.session)
+            authorize_natural_language(
+                ctx.session, lambda: self._agrees(ctx.session, ctx.config.confirm_mode)
+            )
 
     def before_llm(self, session: Session) -> None:
         session.confirmed_batch = False
@@ -142,6 +158,15 @@ class PolicyHooks(Hooks):
         enabled: bool,
     ) -> None:
         if self.trace:
+            binding = {}
+            if ctx.config.proposal_gate and ctx.session.proposals:
+                proposal = ctx.session.proposals[-1]
+                binding = {
+                    "proposal_id": proposal.proposal_id,
+                    "version": proposal.version,
+                    "confirm_source": proposal.confirm_source,
+                    "action_id": ctx.authorized_action.action_id if ctx.authorized_action else None,
+                }
             self.trace.emit(
                 kind,
                 execution_id=ctx.execution_id,
@@ -152,11 +177,13 @@ class PolicyHooks(Hooks):
                 rule_ids=verdict.rule_ids if isinstance(verdict, Deny) else [],
                 reason=verdict.reason if isinstance(verdict, Deny) else "通过",
                 source="guard" if kind == "guard_verdict" else "confirm",
+                **binding,
             )
 
     def before_tool(self, ctx: ToolContext, call: ToolCall) -> Allow | Deny:
         from aftersales.policy.guard import check_access, check_business
 
+        ctx.authorized_action = None
         entry = self.registry.get(call.name)
         if entry is None:
             return Allow()  # Registry returns UNKNOWN_TOOL without executing anything.
@@ -167,7 +194,11 @@ class PolicyHooks(Hooks):
         verdict: Allow | Deny = Allow()
         if ctx.config.guard:
             verdict = check_access(ctx, call)
-            if isinstance(verdict, Allow) and entry.spec.permission == "write":
+            if (
+                isinstance(verdict, Allow)
+                and entry.spec.permission == "write"
+                and not (ctx.config.confirm_gate and ctx.config.proposal_gate)
+            ):
                 try:
                     verdict = check_business(ctx, call.name, args)
                 except ValueError:
@@ -178,6 +209,16 @@ class PolicyHooks(Hooks):
         if entry.spec.permission != "write":
             return Allow()
         session = ctx.session
+        if ctx.config.confirm_gate and ctx.config.proposal_gate:
+            from aftersales.domain.services import PolicyError
+            from aftersales.policy.proposal import bind_action
+
+            try:
+                ctx.authorized_action = bind_action(ctx, call.name, args)
+            except PolicyError as exc:
+                verdict = Deny(str(exc), exc.rule_ids)
+            self._record("confirm_verdict", ctx, call, verdict, enabled=True)
+            return verdict
         if ctx.config.confirm_gate:
             text = session.messages[session.confirmation_user_index].content or ""
             if call.name == "cancel_order" and "不取消订单" in text:
@@ -197,5 +238,16 @@ class PolicyHooks(Hooks):
         self._record("confirm_verdict", ctx, call, verdict, enabled=ctx.config.confirm_gate)
         return verdict
 
+    def after_tool(self, ctx: ToolContext, call: ToolCall, result: ToolResult) -> None:
+        if ctx.authorized_action is not None:
+            from aftersales.policy.proposal import consume_action
+
+            consume_action(ctx.session, ctx.authorized_action, success=not result.is_error)
+            ctx.authorized_action = None
+
     def on_turn_end(self, session: Session, result: TurnResult) -> None:
         session.confirmation_available = session.confirmed_batch = False
+        if session.proposals and result.stop_reason == "end_turn":
+            proposal = session.proposals[-1]
+            if proposal.status == "pending":
+                session.presented_proposal_version = proposal.version

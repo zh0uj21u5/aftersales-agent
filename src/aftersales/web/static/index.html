@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>售后管家 · 执行审计台</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script defer src="/static/app.js"></script>
+</head>
+<body data-pane="workspace">
+  <header class="masthead"><a class="brand" href="/"><h1>售后管家</h1></a></header>
+  <nav class="pane-tabs" aria-label="工作区域">
+    <button data-pane="workspace" aria-pressed="true">客服</button>
+    <button data-pane="audit" aria-pressed="false">审计</button>
+  </nav>
+  <main>
+    <section class="workspace" aria-label="买家客服交互">
+      <div class="section-top"><h2>客服</h2><button id="new-chat" class="quiet">新对话</button></div>
+      <section class="scenarios panel">
+        <h2 class="panel-title">离线演示</h2>
+        <div class="scene-grid">
+          <button data-scene="1">绑定与改方案</button>
+          <button data-scene="2">幂等与恢复</button>
+          <button data-scene="3">规则与审批</button>
+        </div>
+        <div class="demo-control"><span id="demo-label"></span><button id="advance" disabled>下一步</button><button id="run-all" class="quiet" disabled>一键执行</button></div>
+      </section>
+      <div id="proposals"></div>
+      <div id="outcomes"></div>
+      <details class="orders panel" open>
+        <summary>订单 <span id="user-label">未认证</span></summary>
+        <div id="orders"><p class="empty">暂无订单</p></div>
+      </details>
+      <section class="conversation panel">
+        <div class="panel-title"><h2>对话</h2><button id="refresh" class="quiet">刷新</button></div>
+        <div id="messages" aria-live="polite"></div>
+        <form id="chat-form">
+          <label class="sr-only" for="message">发送消息</label>
+          <textarea id="message" rows="2" placeholder="输入消息…" required></textarea>
+          <div class="composer-bottom"><button type="submit">发送</button></div>
+        </form>
+      </section>
+    </section>
+    <aside class="audit" aria-label="执行审计与证据">
+      <div class="section-top"><h2>审计</h2></div>
+      <div class="tabs" role="tablist" aria-label="审计模式">
+        <button role="tab" id="live-tab" aria-selected="true" aria-controls="live">实时交互审计</button>
+        <button role="tab" id="benchmark-tab" aria-selected="false" aria-controls="benchmark">评测回放与对比</button>
+      </div>
+      <section id="live" role="tabpanel" aria-labelledby="live-tab">
+        <div id="live-metrics" class="metrics"></div>
+        <section class="panel"><div id="binding" class="table-wrap"></div></section>
+        <section class="panel"><h3 class="panel-title">状态变化</h3><div id="snapshots"><p class="empty">暂无执行记录</p></div></section>
+        <section class="panel"><h3 class="panel-title">调用记录</h3><div id="timeline"></div></section>
+      </section>
+      <section id="benchmark" role="tabpanel" aria-labelledby="benchmark-tab" hidden>
+        <button id="load-reports" class="quiet">刷新报告</button>
+        <div id="reports" class="table-wrap"></div>
+        <div id="trial-detail"></div>
+      </section>
+    </aside>
+  </main>
+  <div id="status" role="status" aria-live="polite"></div>
+</body>
+</html>

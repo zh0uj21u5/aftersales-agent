@@ -2,7 +2,7 @@
 
 import sys
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 import yaml
@@ -13,6 +13,7 @@ from aftersales.core.config import AgentConfig, load_settings
 from aftersales.core.llm import make_client
 from aftersales.core.loop import Session
 from aftersales.core.runtime import build_agent
+from aftersales.core.session_store import SessionStore
 from aftersales.core.tracing import TraceWriter, render_trace, trace_path
 from aftersales.domain.clock import FixedClock
 from aftersales.domain.db import connect
@@ -39,6 +40,9 @@ def chat(
     trace_dir: Annotated[Path, typer.Option(help="Trace output directory")] = Path("traces"),
     confirm_model: Annotated[
         str | None, typer.Option(help="Optional small classifier model on the same provider")
+    ] = None,
+    session_id: Annotated[
+        str | None, typer.Option("--session", help="Resume a saved session")
     ] = None,
 ) -> None:
     """Chat with the agent; enter /exit to finish and close the trace."""
@@ -69,7 +73,17 @@ def chat(
         llm = make_client(options.provider, options.model)
         classifier = make_client(options.provider, confirm_model) if confirm_model else None
         clock = FixedClock()
+        store = SessionStore(connection, clock)
+        if session_id is not None:
+            try:
+                session = store.load(session_id)
+            except KeyError as exc:
+                raise typer.BadParameter("会话不存在", param_hint="--session") from exc
+        else:
+            session = Session()
+            store.save(session)
         writer = TraceWriter(clock, trace_dir)
+        store.attach_trace(session.session_id, writer.run_id)
         agent = build_agent(
             connection,
             clock,
@@ -81,7 +95,7 @@ def chat(
         )
         console = Console()
         console.print(f"售后管家 · run_id={writer.run_id} · 输入 /exit 退出", markup=False)
-        session = Session()
+        console.print(f"session_id={session.session_id}", markup=False)
         while not session.closed:
             try:
                 user_text = typer.prompt("你")
@@ -205,6 +219,43 @@ def seed(
     except FileExistsError as exc:
         raise typer.BadParameter(str(exc), param_hint="--db") from exc
     typer.echo(f"已生成数据库：{db}（seed={rng_seed}，50 用户 / 120 SKU / 300 订单）")
+
+
+@app.command()
+def serve(
+    db: Annotated[Path, typer.Option(help="Existing seeded SQLite database")] = Path(
+        "data/shop.db"
+    ),
+    port: Annotated[int, typer.Option(min=1, max=65535)] = 8000,
+    offline: Annotated[bool, typer.Option(help="Offline demos; never load credentials")] = False,
+) -> None:
+    """Start the local audit workbench (single worker, loopback only)."""
+    import uvicorn
+
+    from aftersales.web.app import create_app
+
+    if not db.is_file():
+        raise typer.BadParameter("数据库不存在，请先 seed", param_hint="--db")
+    from aftersales.core.llm import LLMResponse
+
+    class OfflineClient:
+        def chat(self, *args: Any, **kwargs: Any) -> LLMResponse:
+            return LLMResponse(
+                text="当前为纯离线模式。请使用演示场景的下一步或确认卡按钮；自由消息已保存。真实客服对话请不带 --offline 启动。"
+            )
+
+    if offline:
+        options = AgentConfig(proposal_gate=True)
+        client = OfflineClient()
+    else:
+        settings = load_settings()
+        options = settings.agent_config().model_copy(update={"proposal_gate": True})
+        client = make_client(options.provider, options.model)
+    uvicorn.run(
+        create_app(db, client, options),
+        host="127.0.0.1",
+        port=port,
+    )
 
 
 if __name__ == "__main__":

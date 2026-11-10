@@ -14,6 +14,7 @@ class AgentConfig(BaseModel):
     policy_mode: Literal["full", "on_demand"] = "full"
     guard: bool = True
     confirm_gate: bool = True
+    proposal_gate: bool = False
     confirm_mode: Literal["heuristic", "llm"] = "heuristic"
     todo: bool = False
     goal_judge: bool = False

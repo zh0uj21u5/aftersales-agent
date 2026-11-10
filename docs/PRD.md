@@ -41,7 +41,7 @@ preview可关闭；Todo开启时另注册内部read工具`update_todo`，仅修�
 
 ## 平台规则与设计意图
 
-具体计算与边界以[POLICY](../src/aftersales/policy/POLICY.md)、共享`check_*`及ADR（本地开发记录，未随发布上传）为准。P01～P12保持原编号与语义。
+具体计算与边界以[POLICY](../src/aftersales/policy/POLICY.md)及共享`check_*`为准。P01～P12保持原编号与语义。
 
 | 规则 | 摘要 | 设计意图 |
 |---|---|---|

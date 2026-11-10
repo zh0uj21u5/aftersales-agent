@@ -5,7 +5,7 @@ import sqlite3
 from datetime import datetime, timedelta
 from typing import TypeVar
 
-from pydantic import BaseModel
+from pydantic import BaseModel, JsonValue
 
 from aftersales.domain.clock import Clock
 from aftersales.domain.db import insert, next_id, transaction
@@ -14,6 +14,7 @@ from aftersales.domain.models import (
     Address,
     ApprovalRequest,
     AuthResult,
+    BusinessSnapshot,
     CheckResult,
     Coupon,
     CouponDetails,
@@ -367,6 +368,46 @@ class Services:
             order=self.get_order(order_id),
             items=items,
             shipment=Shipment.model_validate(dict(row)) if row else None,
+        )
+
+    def action_snapshot(
+        self,
+        order_id: str | None,
+        *,
+        sku_ids: list[str] | None = None,
+        user_coupon_id: str | None = None,
+    ) -> BusinessSnapshot:
+        """Read affected rows inside the caller's execution transaction."""
+
+        def rows(table: str, column: str, ids: list[str]) -> list[dict[str, JsonValue]]:
+            if not ids:
+                return []
+            placeholders = ",".join("?" for _ in ids)
+            result = []
+            for row in self.db.execute(
+                f"SELECT * FROM {table} WHERE {column} IN ({placeholders}) ORDER BY {column}, rowid",
+                ids,
+            ):
+                value = dict(row)
+                for field in ("address", "attrs"):
+                    if field in value:
+                        value[field] = json.loads(value[field])
+                result.append(value)
+            return result
+
+        orders = rows("orders", "id", [order_id] if order_id else [])
+        items = rows("order_items", "order_id", [order_id] if order_id else [])
+        skus = sorted(set(sku_ids or []) | {str(item["sku_id"]) for item in items})
+        coupons = {user_coupon_id} if user_coupon_id else set()
+        coupons |= {str(order["user_coupon_id"]) for order in orders if order["user_coupon_id"]}
+        return BusinessSnapshot(
+            orders=orders,
+            order_items=items,
+            skus=rows("skus", "id", skus),
+            user_coupons=rows("user_coupons", "id", sorted(coupons)),
+            aftersales=rows("aftersales", "order_id", [order_id] if order_id else []),
+            refunds=rows("refunds", "order_id", [order_id] if order_id else []),
+            shipments=rows("shipments", "order_id", [order_id] if order_id else []),
         )
 
     def get_product(self, spu_id: str | None = None, sku_id: str | None = None) -> Product:

@@ -1,0 +1,29 @@
+id: v2_04_changed_quantity
+tags:
+- proposal_v2
+- amendment
+user_profile:
+  phone: '13800000003'
+  name: 用户003
+opening_message: 我是用户003，电话13800000003。O1053的OI00095退2件，无理由退货。先试算并复述，等我确认。
+instruction: 仅执行用户最后明确授权的结构化动作；确认前先展示方案，修改条件须再次确认。
+scripted_replies:
+- 好的，数量改为1件，请重新试算并复述。
+- 确认
+- 确认
+- '###STOP###'
+max_turns: 5
+gold_actions:
+- tool: request_return
+  args:
+    order_id: O1053
+    items:
+    - order_item_id: OI00095
+      qty: 1
+    reason: 无理由退货
+amount_sources:
+- action_index: 0
+must_mention:
+- '95.00'
+must_not: []
+expect_handoff: false

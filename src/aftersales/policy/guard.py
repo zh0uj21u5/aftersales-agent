@@ -4,6 +4,7 @@ from pydantic import BaseModel
 
 from aftersales.core.hooks import Allow, Deny
 from aftersales.core.llm import ToolCall
+from aftersales.domain.models import CheckResult, Violation
 from aftersales.domain.services import (
     check_cancel_order,
     check_exchange,
@@ -37,7 +38,7 @@ def check_access(ctx: ToolContext, call: ToolCall) -> Allow | Deny:
     return Allow()
 
 
-def check_business(ctx: ToolContext, name: str, args: BaseModel) -> Allow | Deny:
+def business_check(ctx: ToolContext, name: str, args: BaseModel) -> CheckResult:
     """Load snapshots; all business decisions live in services.check_* functions."""
     service = ctx.services()
     if name == "create_order":
@@ -74,7 +75,12 @@ def check_business(ctx: ToolContext, name: str, args: BaseModel) -> Allow | Deny
                 service.clock.now(),
             )
     else:
-        return Deny("写工具未配置规则校验", ["DATA"])
+        return CheckResult(violations=[Violation(rule_id="DATA", reason="写工具未配置规则校验")])
+    return result
+
+
+def check_business(ctx: ToolContext, name: str, args: BaseModel) -> Allow | Deny:
+    result = business_check(ctx, name, args)
     if result.allowed:
         return Allow()
     return Deny(

@@ -1,6 +1,6 @@
 [project]
 name = "aftersales-agent"
-version = "1.0.0"
+version = "2.0.0"
 description = "An e-commerce after-sales & order fulfillment agent that executes write operations under hard-checked policy."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -12,10 +12,12 @@ dependencies = [
     "rich>=13.7",
     "python-dotenv>=1.0",
     "pyyaml>=6.0",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "ruff>=0.6"]
+dev = ["pytest>=8.0", "ruff>=0.6", "httpx>=0.27"]
 
 [project.scripts]
 aftersales = "aftersales.cli:app"
@@ -26,7 +28,11 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aftersales", "evals"]
-exclude = ["evals/reports/**"]
+exclude = ["evals/reports/**", "src/aftersales/web/static/**"]
+
+# Include static assets once via force-include, outside automatic package discovery.
+[tool.hatch.build.targets.wheel.force-include]
+"src/aftersales/web/static" = "aftersales/web/static"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

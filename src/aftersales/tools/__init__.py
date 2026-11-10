@@ -18,17 +18,14 @@ def build_registry(config: AgentConfig) -> ToolRegistry:
         query.list_user_coupons,
         query.lookup_policy,
         query.calculate,
-        write.modify_address,
-        write.cancel_order,
-        write.apply_price_protection,
-        write.request_return,
-        write.request_exchange,
-        write.create_order,
+        *write.WRITE_TOOLS,
         escalate.submit_approval,
         escalate.transfer_to_human,
     ]
     if config.preview_tool:
         functions.append(query.preview_refund)
+    if config.proposal_gate:
+        functions.append(query.propose_actions)
     if config.todo:
         from aftersales.core.context import update_todo
 

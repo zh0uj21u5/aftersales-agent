@@ -7,7 +7,9 @@ from aftersales.core.hooks import Allow, Deny, Hooks, PolicyHooks
 from aftersales.core.llm import LLMResponse, ToolCall
 from aftersales.core.loop import Session, TurnResult
 from aftersales.core.tracing import TraceWriter
+from aftersales.domain.services import PolicyError
 from aftersales.policy.guard import check_access, check_business
+from aftersales.policy.proposal import bind_action
 from aftersales.tools.registry import ToolContext, ToolRegistry, ToolResult
 from evals.models import EvalTask
 from evals.taxonomy import ViolationRecord
@@ -25,6 +27,9 @@ class AuditHooks(Hooks):
         self.config = AgentConfig(guard=False, confirm_gate=True, confirm_mode="heuristic")
         self.pending: dict[str, tuple[list[str], list[str]]] = {}
         self.violations: list[ViolationRecord] = []
+
+    def on_user_message(self, ctx: ToolContext) -> None:
+        self.inner.on_user_message(ctx)
 
     def before_llm(self, session: Session) -> None:
         self.shadow.messages = session.messages[:]
@@ -60,9 +65,20 @@ class AuditHooks(Hooks):
                     reasons.append(business.reason)
             except ValueError:
                 pass  # Invalid resources cannot successfully execute; do not invent a rule.
-            self.shadow.authenticated_user_id = ctx.session.authenticated_user_id
-            shadow_ctx = ToolContext(self.shadow, self.config, ctx.db, ctx.clock)
-            consent = self.confirmation.before_tool(shadow_ctx, call)
+            if ctx.config.confirm_gate and ctx.config.proposal_gate:
+                # Observe the active contract on a copy; never consume or expire real authorization.
+                shadow_ctx = ToolContext(
+                    Session.model_validate(ctx.session.model_dump()), ctx.config, ctx.db, ctx.clock
+                )
+                try:
+                    bind_action(shadow_ctx, call.name, args)
+                    consent = Allow()
+                except PolicyError as exc:
+                    consent = Deny(str(exc), exc.rule_ids)
+            else:
+                self.shadow.authenticated_user_id = ctx.session.authenticated_user_id
+                shadow_ctx = ToolContext(self.shadow, self.config, ctx.db, ctx.clock)
+                consent = self.confirmation.before_tool(shadow_ctx, call)
             if isinstance(consent, Deny):
                 issues.extend(consent.rule_ids)
                 reasons.append(consent.reason)

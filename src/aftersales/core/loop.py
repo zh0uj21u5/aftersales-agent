@@ -2,18 +2,20 @@
 
 import json
 from collections.abc import Callable
-from typing import Literal
+from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 from aftersales.core.config import AgentConfig
-from aftersales.core.context import TodoItem, prepare_messages, with_todo
+from aftersales.core.context import TodoItem, prepare_messages, with_proposal_contract, with_todo
 from aftersales.core.goal_judge import GoalJudge, missing_feedback, should_judge
 from aftersales.core.hooks import Deny, Hooks
 from aftersales.core.llm import LLMClient, Message, ToolCall, Usage
+from aftersales.core.session_store import SessionStore
 from aftersales.core.tracing import TraceWriter
-from aftersales.tools.registry import ToolContext, ToolRegistry, ToolResult
+from aftersales.policy.proposal import ActionProposal, expire_identity
+from aftersales.tools.registry import ToolContext, ToolRegistry, ToolResult, tool_result_message
 
 SYSTEM = (
     "你是售后管家。按工具的实际执行结果回答，不得声称未执行的操作已经完成。"
@@ -22,6 +24,12 @@ SYSTEM = (
 
 
 class Session(BaseModel):
+    _store: SessionStore | None = PrivateAttr(default=None)
+    _revision: int | None = PrivateAttr(default=None)
+    updated_at: str | None = None
+    session_id: str = Field(default_factory=lambda: uuid4().hex)
+    proposals: list[ActionProposal] = Field(default_factory=list)
+    presented_proposal_version: int | None = None
     messages: list[Message] = Field(default_factory=list)
     authenticated_user_id: str | None = None
     todo: list[TodoItem] = Field(default_factory=list)
@@ -32,6 +40,16 @@ class Session(BaseModel):
     confirmation_identity: str | None = None
     confirmation_proposal: str = ""
     confirmed_batch: bool = False
+
+    def persist(self) -> None:
+        if self._store is not None:
+            self._store.save(self)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        previous = self.authenticated_user_id if name == "authenticated_user_id" else None
+        super().__setattr__(name, value)
+        if name == "authenticated_user_id" and value != previous:
+            expire_identity(self)
 
 
 TurnStopReason = Literal["end_turn", "max_steps", "error", "handoff", "session_ended"]
@@ -57,6 +75,7 @@ class Agent:
         system: str | Callable[[], str] = SYSTEM,
         trace: TraceWriter | None = None,
         goal_judge: GoalJudge | None = None,
+        session_store: SessionStore | None = None,
     ) -> None:
         self.llm = llm
         self.registry = registry
@@ -68,17 +87,24 @@ class Agent:
         self.system = system
         self.trace = trace
         self.goal_judge = goal_judge
+        self.session_store = session_store
         if self.config.goal_judge and goal_judge is None:
             raise ValueError("goal_judge=True requires a completion judge")
 
     def respond(self, session: Session, user_text: str) -> TurnResult:
+        if session._store is None and self.session_store is not None:
+            session._store = self.session_store
         if session.closed:
             return TurnResult(reply="本次会话已转人工并结束。", stop_reason="session_ended")
+        if session._revision is not None:
+            self._recover_interrupted_batch(session)
         session.messages.append(Message(role="user", content=user_text))
         turn_id = uuid4().hex
         if self.trace:
             self.trace.emit("user_msg", content=user_text, turn_id=turn_id)
         ctx = self.ctx_factory(session)
+        self.hooks.on_user_message(ctx)
+        session.persist()
         calls: list[ToolCall] = []
         usage = Usage()
         previous: str | None = None
@@ -100,6 +126,7 @@ class Agent:
                 steps=steps,
             )
             self.hooks.on_turn_end(session, result)
+            session.persist()
             if self.trace:
                 self.trace.emit(
                     "assistant_msg", content=reply, stop_reason=reason, steps=steps, turn_id=turn_id
@@ -109,7 +136,10 @@ class Agent:
         for step in range(1, self.config.max_steps + 1):
             self.hooks.before_llm(session)
             system = with_todo(
-                (self.system() if callable(self.system) else self.system)
+                with_proposal_contract(
+                    self.system() if callable(self.system) else self.system,
+                    self.config.confirm_gate and self.config.proposal_gate,
+                )
                 + goal_feedback
                 + recovery,
                 session.todo,
@@ -185,6 +215,7 @@ class Agent:
             handed_off = False
             for call in response.tool_calls:
                 calls.append(call)
+                ctx.tool_call_id, ctx.result_checkpointed = call.id, False
                 ctx.execution_id = f"{turn_id}:{len(calls)}"
                 entry = self.registry.get(call.name)
                 permission = entry.spec.permission if entry else None
@@ -252,16 +283,9 @@ class Agent:
                         permission=permission,
                         **result.model_dump(mode="json"),
                     )
-                # JSON quoting escapes delimiters embedded in untrusted tool data.
-                quoted = json.dumps(result.content, ensure_ascii=False).replace("<", "\\u003c")
-                session.messages.append(
-                    Message(
-                        role="tool",
-                        tool_call_id=call.id,
-                        is_error=result.is_error,
-                        content=f"<tool_result>{quoted}</tool_result>",
-                    )
-                )
+                if not ctx.result_checkpointed:
+                    session.messages.append(tool_result_message(call.id, result))
+                session.persist()
             if handed_off:
                 return finish("已为你转接人工，本次会话结束。", "handoff", step)
             if truncated:
@@ -269,3 +293,36 @@ class Agent:
         return finish(
             "已达到本轮处理步数上限，请补充信息后继续。", "max_steps", self.config.max_steps
         )
+
+    @staticmethod
+    def _recover_interrupted_batch(session: Session) -> None:
+        """Close a crashed batch without automatically replaying unexecuted calls."""
+        from collections import Counter
+
+        index = next(
+            (
+                i
+                for i in range(len(session.messages) - 1, -1, -1)
+                if session.messages[i].role == "assistant"
+            ),
+            None,
+        )
+        if index is None or not session.messages[index].tool_calls:
+            return
+        trailing = session.messages[index + 1 :]
+        if any(message.role != "tool" for message in trailing):
+            return
+        replies = Counter(message.tool_call_id for message in trailing)
+        for call in session.messages[index].tool_calls:
+            if replies[call.id]:
+                replies[call.id] -= 1
+                continue
+            session.messages.append(
+                tool_result_message(
+                    call.id,
+                    ToolResult(
+                        content="[INTERRUPTED] 上次处理已中断，此调用没有已保存的结果，请查询状态后继续。",
+                        is_error=True,
+                    ),
+                )
+            )

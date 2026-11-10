@@ -27,6 +27,7 @@ EventType = Literal[
     "tool_result",
     "goal_judge",
     "context_compaction",
+    "recovery",
     "run_end",
 ]
 

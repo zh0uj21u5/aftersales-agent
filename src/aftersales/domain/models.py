@@ -131,6 +131,18 @@ class OperationResult(BaseModel):
     record_ids: list[str] = Field(default_factory=list)
 
 
+class BusinessSnapshot(BaseModel):
+    """Database rows keyed by table; column schemas are defined in schema.sql."""
+
+    orders: list[dict[str, JsonValue]] = Field(default_factory=list)
+    order_items: list[dict[str, JsonValue]] = Field(default_factory=list)
+    skus: list[dict[str, JsonValue]] = Field(default_factory=list)
+    user_coupons: list[dict[str, JsonValue]] = Field(default_factory=list)
+    aftersales: list[dict[str, JsonValue]] = Field(default_factory=list)
+    refunds: list[dict[str, JsonValue]] = Field(default_factory=list)
+    shipments: list[dict[str, JsonValue]] = Field(default_factory=list)
+
+
 class ApprovalRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     action: Action
