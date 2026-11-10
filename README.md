@@ -2,7 +2,7 @@
 
 在平台规则内执行改地址、取消订单、价保、退货、换货和重新下单的电商售后 Agent。Python 3.11 + SQLite，自研模型适配、Agent 循环、工具、Guard、确认门和评测，不使用 Agent 编排框架。支付、物流和审批均为本地模拟，不接真实商家系统。
 
-v2.0.0 在冻结的 v1.0 基线上新增服务端Proposal绑定授权、动作级幂等恢复与双栏审计工作台。无需模型凭据即可运行 `aftersales serve --offline` 演示三条完整链路，启动说明见下方工作台小节。
+v2.0.1 增加内置评测回放，并校验自然语言确认前的提案复述。无需模型凭据即可运行 `aftersales serve --offline` 演示三条完整链路，启动说明见下方工作台小节。
 
 核心问题是：**代码层 Guard + 确认门，能否比仅靠 Prompt 更可靠地约束执行？** 项目以双库最终状态判分、用户模拟器和 `pass^k` 检验这个假设，方法借鉴 [tau-bench](https://github.com/sierra-research/tau-bench)。已有具体越权读取拦截与确认合同执行证据；小样本尚不足以宣称违规率、注入成功率普遍或统计显著下降。
 
@@ -123,7 +123,15 @@ $chatTrace = Get-ChildItem "$runRoot/chat-traces/*.jsonl" | Select-Object -First
 
 纯离线即可一键或分步演示三条链路：① O1006改址+价保¥57.00，篡改/夹带P02拦截，部分同意后P0002 v2只改址；② 真实事务提交后丢响应，同键重放保留原退款流水，异参冲突与刷新恢复；③ P01越权拦截，O1005退3件¥450.00触发P08并生成AP0001 pending。每次场景独立种子库，原shop库不受影响。默认“下一步”会展示预设调用；确认卡按钮也可直接批准/拒绝当前方案。面试建议用下一步完整讲解预设链路。
 
-左栏展示买家订单、对话、服务端确认卡与执行结果；右栏“实时交互审计”对齐提案/授权/执行键、显示事务快照字段变化与Trace。“评测回放与对比”只读加载本地 `evals/reports/*.json` 的指标和Agent/Gold双库终态差异；新克隆没有忽略的历史JSON时会显示空列表。自由聊天不伪造Gold库。
+左栏展示买家订单、对话、服务端确认卡与执行结果。右栏「实时交互审计」对齐提案、授权和执行记录，并显示事务快照的字段变化与 Trace。
+
+![实时交互审计工作台，左侧为订单与对话，右侧为三方核验和 Before/After 字段差异](docs/assets/workbench-live-audit.jpg)
+
+「评测回放与对比」合并两份内置 M7 专项报告与本地 `evals/reports/*.json`。新克隆可直接离线查看 Agent 与 Gold 的双库终态差异，同 ID 以本地报告为准。选择 `3b583330d2` 并展开 `v2_04_changed_quantity` 可查看一条实际差异。截图也显示了演示环境中的额外本地报告。
+
+![评测回放工作台，右侧显示报告列表及 Gold 与 Agent 的双库终态差异](docs/assets/workbench-eval-replay.jpg)
+
+自然语言确认前，服务端会校验复述中明确写出的订单号与金额。任一值与方案不符时，用户回复「确认」无法批准该方案。Web 按钮直接批准用户看到的服务端结构化确认卡。
 
 移除 `--offline` 可用 `.env` 模型发送自由消息，会消耗Token；离线模式不加载凭据，自由输入仅保存并提示使用剧本。服务只监听127.0.0.1，浏览器保存session_id，刷新后从SQLite恢复。工作台实现见 [ARCHITECTURE](docs/ARCHITECTURE.md)，专项实测见 [RESULTS](docs/RESULTS.md)。真实实验不随启动或演示自动运行。
 
@@ -135,7 +143,7 @@ src/aftersales/
   tools/             registry / auth / query / write / escalate
   domain/            clock / schema.sql / seed / db / models / services / calculator
   prompts/           system.md
-  web/               app / demos / static（原生HTML/CSS/JS）
+  web/               app / demos / static（原生HTML/CSS/JS）/ samples（内置回放）
 configs/             baseline → guard_only/guard/on_demand/todo/goal_judge/full
 evals/               60条基准任务 / 8条专项任务 / runner / simulator / replay / audit / grader
 scripts/             demo.py / gen_expectations.py / eval_proposals.py
@@ -147,6 +155,6 @@ docs/                产品、架构与实验结果
 - [POLICY：P01～P15规则](src/aftersales/policy/POLICY.md)
 - [RESULTS：历史实验与 M7 专项对照](docs/RESULTS.md)
 
-`.env`、`data/`、`traces/`、报告JSON不提交；Markdown保留实验来源。`seed`拒绝覆盖已有库。历史 JSON、trace 与缓存保留在本地，公开的 Markdown 报告可直接阅读。
+`.env`、`data/`、`traces/`、`evals/reports/` 中生成的报告 JSON 保留在本地。内置回放样本随包分发。`seed` 拒绝覆盖已有库，公开的 Markdown 报告可直接阅读。
 
 文中的历史提交号用于标识本地实验版本，公开发布分支有独立的提交历史。

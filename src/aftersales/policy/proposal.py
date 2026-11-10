@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -22,6 +23,9 @@ WriteToolName = Literal[
     "request_exchange",
     "create_order",
 ]
+
+_MONEY_NUMBER = r"[+\-−]?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|\.\d+)"
+_MONEY = re.compile(rf"([+\-−])?[¥￥]\s*({_MONEY_NUMBER})|({_MONEY_NUMBER})\s*元")
 
 
 class ActionRequest(BaseModel):
@@ -51,6 +55,27 @@ class ActionProposal(BaseModel):
     confirm_source: Literal["natural_language", "web_button"] | None = None
     actions: list[ProposedAction] = Field(min_length=1)
     created_at: str
+
+
+def presentation_matches(reply: str, proposal: ActionProposal) -> bool:
+    """Check explicit order IDs and currency amounts against the server's proposal."""
+    order_ids = {action.canonical_args.get("order_id") for action in proposal.actions}
+    if not set(re.findall(r"O\d{4,}", reply)).issubset(order_ids):
+        return False
+    amounts = [
+        action.preview_amount_cents
+        for action in proposal.actions
+        if action.preview_amount_cents is not None
+    ]
+    allowed = {*amounts, sum(amounts)} if amounts else set()
+    for sign, prefixed, suffixed in _MONEY.findall(reply):
+        if sign and prefixed.startswith(("+", "-", "−")):
+            return False
+        value = (sign + prefixed if prefixed else suffixed).replace(",", "").replace("−", "-")
+        cents, denominator = Decimal(f"{value}e2").as_integer_ratio()
+        if denominator != 1 or cents not in allowed:
+            return False
+    return True
 
 
 class ProposalResult(BaseModel):
@@ -345,6 +370,7 @@ def authorize_natural_language(session: SessionState, agrees: Callable[[], bool]
         proposal.status == "pending"
         and session.confirmation_proposal
         and session.presented_proposal_version == proposal.version
+        and presentation_matches(session.confirmation_proposal, proposal)
         and whole_plan_acknowledgment(text)
         and agrees()
     ):

@@ -15,7 +15,7 @@ from aftersales.core.runtime import build_system
 from aftersales.core.tracing import TraceWriter, read_trace
 from aftersales.domain.db import dump_hashes
 from aftersales.domain.services import PolicyError, Services
-from aftersales.policy.proposal import decide_proposal
+from aftersales.policy.proposal import decide_proposal, presentation_matches
 from aftersales.tools import build_registry
 from aftersales.tools.registry import ToolContext
 from evals.models import load_tasks
@@ -144,6 +144,94 @@ def test_compound_independent_actions_in_either_order(shop: Services, reverse: b
     assert shop.get_order("O1006").price_protected
     assert shop.refunded_cents("O1006") == 5700
     assert not any(m.is_error for m in results(session))
+
+
+@pytest.mark.parametrize(
+    "tool, reply",
+    [
+        ("modify_address", "订单 O1005 改送公司88号，请确认。"),
+        ("apply_price_protection", "订单 O1006 预计退差 ¥100.00，请确认。"),
+        ("modify_address", "订单 O1006 改址并退差 ¥50.00，请确认。"),
+        ("apply_price_protection", "订单 O1006 预计退款 ¥57.00，实际到账 100元，请确认。"),
+    ],
+)
+def test_mismatched_presentation_blocks_natural_confirmation(
+    shop: Services, tool: str, reply: str
+) -> None:
+    # O1006: price difference 3000 * 2 * (24700 / 26000) = 5700 cents.
+    request = (
+        address_action(shop)
+        if tool == "modify_address"
+        else action(tool, order_id="O1006", order_item_id=shop.order_details("O1006").items[0].id)
+    )
+    agent, session, _ = setup_agent(
+        shop,
+        [
+            propose(request),
+            LLMResponse(text=reply),
+            using(as_call(request)),
+            LLMResponse(text="需要重新说明方案"),
+        ],
+    )
+    before = dump_hashes(shop.db)
+    agent.respond(session, "请生成方案")
+    proposal = session.proposals[-1]
+    assert proposal.actions[0].preview_amount_cents == (None if tool == "modify_address" else 5700)
+    assert session.presented_proposal_version is None
+    agent.respond(session, "确认")
+    assert "[POLICY_VIOLATION P02]" in results(session)[-1].content
+    assert proposal.status == "pending" and proposal.confirm_source is None
+    assert dump_hashes(shop.db) == before
+
+
+def test_presentation_accepts_action_amounts_and_total(shop: Services) -> None:
+    # Reorder one S0001 at 10000 cents; O1006 price protection is 5700 cents.
+    price = action("apply_price_protection", order_id="O1006", order_item_id="OI00006")
+    buy = action(
+        "create_order",
+        user_id="U006",
+        items=[{"sku_id": "S0001", "qty": 1}],
+        payment_method_id="PM0006",
+    )
+    agent, session, _ = setup_agent(shop, [propose(buy, price), LLMResponse(text="确认方案？")])
+    agent.respond(session, "重新下单并申请价保")
+    proposal = session.proposals[-1]
+    assert presentation_matches("O1006：¥ 57、￥100.00，合计 157.00 元。", proposal)
+    assert not presentation_matches("O1006：合计 157.001 元。", proposal)
+    assert not presentation_matches("O1006：退 ¥57，另有 O1005。", proposal)
+
+
+def test_stale_presentation_marker_cannot_authorize_but_web_button_can(shop: Services) -> None:
+    request = address_action(shop)
+    agent, session, _ = setup_agent(
+        shop,
+        [
+            propose(request),
+            LLMResponse(text="订单 O1006 改送公司88号，请确认。"),
+            LLMResponse(text="更正，订单 O1005 改送公司88号，请确认。"),
+            using(as_call(request)),
+            LLMResponse(text="需要重新说明方案"),
+            using(as_call(request)),
+            LLMResponse(text="已改址"),
+        ],
+    )
+    agent.respond(session, "请生成方案")
+    proposal = session.proposals[-1]
+    assert session.presented_proposal_version == proposal.version
+    agent.respond(session, "请复述一下")
+    assert session.presented_proposal_version is None
+
+    # A session saved before grounding may still have an unchecked presentation marker.
+    session.presented_proposal_version = proposal.version
+    before = dump_hashes(shop.db)
+    agent.respond(session, "确认")
+    assert "[POLICY_VIOLATION P02]" in results(session)[-1].content
+    assert dump_hashes(shop.db) == before
+
+    decide_proposal(session, proposal.proposal_id, proposal.version, "approve")
+    agent.respond(session, "请执行")
+    assert proposal.confirm_source == "web_button" and proposal.status == "consumed"
+    assert shop.get_order("O1006").address.detail == "公司88号"
 
 
 @pytest.mark.parametrize(

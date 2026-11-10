@@ -34,13 +34,10 @@ def test_static_assets_and_wheel_manifest(workbench: tuple[TestClient, Path, Moc
         response = client.get("/static/" + asset)
         assert response.status_code == 200 and len(response.content) > 1000
     config = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
-    assert config["tool"]["hatch"]["build"]["targets"]["wheel"]["force-include"] == {
-        "src/aftersales/web/static": "aftersales/web/static"
-    }
-    assert (
-        "src/aftersales/web/static/**"
-        in config["tool"]["hatch"]["build"]["targets"]["wheel"]["exclude"]
-    )
+    wheel = config["tool"]["hatch"]["build"]["targets"]["wheel"]
+    for folder in ("static", "samples"):
+        assert wheel["force-include"][f"src/aftersales/web/{folder}"] == f"aftersales/web/{folder}"
+        assert f"src/aftersales/web/{folder}/**" in wheel["exclude"]
     assert client.get("/static/../app.py").status_code == 404
     assert model.requests == []
 

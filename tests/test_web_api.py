@@ -203,6 +203,35 @@ def test_p08_card_does_not_refund(api: tuple[TestClient, MockLLM, Path]) -> None
     db.close()
 
 
+SAMPLE_RUN_IDS = ["2ed0fe45f340406e88d759f48c7600bd", "3b583330d28a465fb6c07448abef00dd"]
+
+
+@pytest.mark.parametrize("create_directory", [False, True])
+def test_bundled_reports_supply_agent_gold_replay(
+    api: tuple[TestClient, MockLLM, Path], create_directory: bool
+) -> None:
+    client, mock, database = api
+    if create_directory:
+        (database.parent / "reports").mkdir()
+    assert client.get("/api/evals/reports").json() == [
+        {"run_id": run_id} for run_id in SAMPLE_RUN_IDS
+    ]
+    for run_id in SAMPLE_RUN_IDS:
+        response = client.get(f"/api/evals/reports/{run_id}")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["run_id"] == run_id and len(data["trials"]) == 8
+    report = client.get(f"/api/evals/reports/{SAMPLE_RUN_IDS[1]}").json()
+    differences = [
+        change for trial in report["trials"] for change in trial["grade"]["database_diff"]
+    ]
+    assert any(
+        change["table"] == "order_items" and change["missing"] and change["extra"]
+        for change in differences
+    )
+    assert mock.requests == []
+
+
 def test_reports_are_read_only_and_paths_confined(api: tuple[TestClient, MockLLM, Path]) -> None:
     client, mock, database = api
     directory = database.parent / "reports"
@@ -211,8 +240,16 @@ def test_reports_are_read_only_and_paths_confined(api: tuple[TestClient, MockLLM
     data = {"run_id": "run-1", "metrics": {"pass^1": 1}, "results": []}
     path.write_text(json.dumps(data), encoding="utf-8")
     original = path.read_bytes()
-    assert client.get("/api/evals/reports").json() == [{"run_id": "run-1"}]
+    assert client.get("/api/evals/reports").json() == [
+        {"run_id": run_id} for run_id in [*SAMPLE_RUN_IDS, "run-1"]
+    ]
     assert client.get("/api/evals/reports/run-1").json() == data
+    override = directory / f"{SAMPLE_RUN_IDS[0]}.json"
+    override.write_text(
+        json.dumps({"run_id": SAMPLE_RUN_IDS[0], "source": "local"}), encoding="utf-8"
+    )
+    assert client.get(f"/api/evals/reports/{SAMPLE_RUN_IDS[0]}").json()["source"] == "local"
+    assert client.get("/api/evals/reports").json().count({"run_id": SAMPLE_RUN_IDS[0]}) == 1
     assert client.get("/api/evals/reports/missing").status_code == 404
     assert client.get("/api/evals/reports/%2e%2e%5cshop").status_code == 404
     assert client.post("/api/evals/reports/run-1", json={}).status_code == 405
@@ -221,7 +258,6 @@ def test_reports_are_read_only_and_paths_confined(api: tuple[TestClient, MockLLM
 
 def test_missing_invalid_inputs_and_no_model_on_read(api: tuple[TestClient, MockLLM, Path]) -> None:
     client, mock, _ = api
-    assert client.get("/api/evals/reports").json() == []
     assert client.get("/api/sessions/missing").status_code == 404
     assert (
         client.post("/api/sessions", json={"authenticated_user_id": "missing"}).status_code == 400

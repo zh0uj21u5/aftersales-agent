@@ -246,8 +246,15 @@ class PolicyHooks(Hooks):
             ctx.authorized_action = None
 
     def on_turn_end(self, session: Session, result: TurnResult) -> None:
+        from aftersales.policy.proposal import presentation_matches
+
         session.confirmation_available = session.confirmed_batch = False
-        if session.proposals and result.stop_reason == "end_turn":
+        if session.proposals:
             proposal = session.proposals[-1]
             if proposal.status == "pending":
-                session.presented_proposal_version = proposal.version
+                session.presented_proposal_version = (
+                    proposal.version
+                    if result.stop_reason == "end_turn"
+                    and presentation_matches(result.reply, proposal)
+                    else None
+                )

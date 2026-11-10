@@ -89,7 +89,9 @@ def create_app(
     business_clock = clock or FixedClock()
     lock = RLock()
     app = FastAPI(title="售后管家 · 执行审计工作台")
-    static = Path(__file__).parent / "static"
+    web_dir = Path(__file__).parent
+    static = web_dir / "static"
+    report_sources = (Path(report_dir), web_dir / "samples")
     app.mount("/static", StaticFiles(directory=static), name="static")
     demos = database.parent / (database.stem + "-demos")
 
@@ -277,20 +279,22 @@ def create_app(
     def report_path(run_id: str) -> Path:
         if not re.fullmatch(r"[a-zA-Z0-9_-]{1,100}", run_id):
             raise HTTPException(404, "报告不存在")
-        path = Path(report_dir) / f"{run_id}.json"
-        if path.resolve().parent != Path(report_dir).resolve() or not path.is_file():
-            raise HTTPException(404, "报告不存在")
-        return path
+        for directory in report_sources:
+            path = directory / f"{run_id}.json"
+            if path.is_file() and path.resolve().parent == directory.resolve():
+                return path
+        raise HTTPException(404, "报告不存在")
 
     @app.get("/api/evals/reports", response_model=list[ReportSummary])
     def reports() -> list[ReportSummary]:
         result = []
-        for path in sorted(Path(report_dir).glob("*.json")):
+        run_ids = {path.stem for directory in report_sources for path in directory.glob("*.json")}
+        for run_id in sorted(run_ids):
             try:
-                report_path(path.stem)
+                report_path(run_id)
             except HTTPException:
                 continue
-            result.append(ReportSummary(run_id=path.stem))
+            result.append(ReportSummary(run_id=run_id))
         return result
 
     @app.get("/api/evals/reports/{run_id}", response_model=dict[str, JsonValue])
