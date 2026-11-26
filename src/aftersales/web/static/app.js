@@ -10,7 +10,12 @@ const el = (tag, text, className) => {
 const money = cents => cents == null ? "—" : `¥${Math.trunc(cents / 100).toLocaleString("zh-CN")}.${String(Math.abs(cents % 100)).padStart(2, "0")}`;
 const json = value => JSON.stringify(value, null, 2);
 const orderStatus = {pending_payment:"待支付", pending_shipment:"待发货", shipped:"已发货", delivered:"已签收", completed:"已完成", aftersale:"售后中", cancelled:"已取消"};
-let state = null, busy = false;
+let state = null, busy = false, liveEvents = [];
+
+function mergeTraces(previous, next) {
+  const merged = new Map([...previous, ...next].map(event => [event.seq, event]));
+  return [...merged.values()].sort((left, right) => left.seq - right.seq);
+}
 
 function notify(text) {
   $("status").textContent = text;
@@ -37,10 +42,91 @@ async function task(action) {
   }
 }
 function setState(session) {
+  if (state?.session_id === session.session_id) {
+    session.trace_events = mergeTraces(state.trace_events, session.trace_events);
+  }
   state = session;
   localStorage.setItem("aftersales-session", session.session_id);
   render();
 }
+async function restoreSession(sessionId) {
+  let cursor = state?.session_id === sessionId ? (state.trace_events.at(-1)?.seq ?? 0) : 0;
+  setState(await api(`/api/sessions/${sessionId}`));
+  const history = [];
+  let more;
+  do {
+    const page = await api(`/api/sessions/${sessionId}/traces?after_seq=${cursor}`);
+    history.push(...page.events);
+    cursor = page.next_seq;
+    more = page.has_more;
+  } while (more);
+  if (state?.session_id === sessionId) {
+    state.trace_events = mergeTraces(state.trace_events, history);
+    renderOutcomes();
+    audit();
+  }
+}
+
+async function streamMessage(sessionId, content) {
+  const response = await fetch(`/api/sessions/${sessionId}/messages/stream`, {
+    method:"POST", headers:{"Content-Type":"application/json"}, body:json({content})
+  });
+  if (!response.ok) {
+    const data = await response.json();
+    throw Error(typeof data.detail === "string" ? data.detail : json(data.detail));
+  }
+  const messages = $("messages"), preview = el("div", "", "bubble assistant");
+  const buyer = el("div", content, "bubble user");
+  buyer.setAttribute("aria-label", "买家");
+  preview.setAttribute("aria-label", "售后管家正在回复");
+  messages.append(buyer, preview);
+  messages.scrollTop = messages.scrollHeight;
+  const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+  let buffer = "", result, failure;
+  try {
+    for (;;) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      buffer += value;
+      let boundary;
+      while ((boundary = /\r?\n\r?\n/.exec(buffer)) !== null) {
+        const frame = buffer.slice(0, boundary.index);
+        buffer = buffer.slice(boundary.index + boundary[0].length);
+        let event = "message";
+        const payload = [];
+        for (const line of frame.split(/\r?\n/)) {
+          if (line.startsWith("event:")) event = line.slice(6).replace(/^ /, "");
+          if (line.startsWith("data:")) payload.push(line.slice(5).replace(/^ /, ""));
+        }
+        if (!payload.length) continue;
+        const data = JSON.parse(payload.join("\n"));
+        if (event === "assistant_delta") {
+          if (data.replace) preview.textContent = "";
+          preview.textContent += data.text;
+          messages.scrollTop = messages.scrollHeight;
+        } else if (event === "turn_end") {
+          result = data;
+        } else if (event === "error") {
+          failure = typeof data.message === "string" ? data.message : data.message.message;
+        } else if (["tool_call", "guard_verdict", "confirm_verdict", "tool_result", "proposal_created"].includes(event)) {
+          if (event === "tool_call") preview.textContent = "";
+          liveEvents.push({event, data});
+          audit();
+        }
+      }
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+    buyer.remove();
+    preview.remove();
+    liveEvents = [];
+    audit();
+  }
+  if (!result) throw Error(failure || "连接已中断，请刷新查看已处理的结果。");
+  setState(result.session);
+  if (failure) notify(failure);
+}
+
 function detail(parent, title, value) {
   const node = el("details");
   node.append(el("summary", title), el("pre", json(value)));
@@ -64,7 +150,7 @@ function renderOrders() {
     const [items, rows] = table(["商品行 / SKU", "件数", "券后实付", "已退"], "items");
     snapshot.order_items.forEach(item => {
       const row = el("tr");
-      row.append(el("td", `${item.id} / ${item.sku_id}`, "record-id"), el("td", item.qty, "num"), el("td", money(item.paid_share_cents), "num"), el("td", money(item.refunded_cents), "num"));
+      row.append(el("td", `${item.id} / ${item.sku_id}`, "record-id"), el("td", item.qty, "num"), el("td", money(item.paid_share_cents), "num"), el("td", item.is_partially_returned ? `${money(item.refunded_cents)} · 部分退货` : money(item.refunded_cents), "num"));
       rows.append(row);
     });
     card.append(header, items);
@@ -142,7 +228,7 @@ function render() {
   audit();
 }
 function audit() {
-  const events = state?.trace_events || [], proposals = state?.proposals || [], executions = state?.action_executions || [];
+  const events = [...(state?.trace_events || []), ...liveEvents], proposals = state?.proposals || [], executions = state?.action_executions || [];
   const blocked = events.filter(event => event.data.allowed === false && !event.data.audit_only).length;
   const tokens = events.filter(event => event.event === "llm_call").reduce((sum, event) => sum + (event.data.tokens?.input_tokens || 0) + (event.data.tokens?.output_tokens || 0), 0);
   $("live-metrics").replaceChildren();
@@ -196,7 +282,10 @@ function audit() {
     const node = el("details", undefined, `event ${denied ? "blocked" : data.permission === "write" ? "write" : ""}`);
     const summary = el("summary");
     summary.append(el("time", event.timestamp?.slice(11, 19) || ""), el("strong", event.event), el("span", data.name || data.status || ""));
-    if (event.event === "llm_call") summary.append(el("span", `${data.tokens?.input_tokens || 0} in / ${data.tokens?.output_tokens || 0} out · ${data.latency_ms}ms`, "muted num"));
+    if (event.event === "llm_call") {
+      const cached = data.tokens?.cached_tokens;
+      summary.append(el("span", `${data.tokens?.input_tokens || 0} in / ${data.tokens?.output_tokens || 0} out${cached ? " · 缓存 " + cached : ""} · ${data.latency_ms}ms`, "muted num"));
+    }
     node.append(summary, el("pre", json(data)));
     $("timeline").append(node);
   });
@@ -260,15 +349,14 @@ $("advance").onclick = () => task(async () => setState(await api(`/api/sessions/
 $("run-all").onclick = () => task(async () => {
   while (state.demo.step < state.demo.total) setState(await api(`/api/sessions/${state.session_id}/demo/advance`, {}));
 });
-$("refresh").onclick = () => task(async () => { if (state) setState(await api(`/api/sessions/${state.session_id}`)); });
+$("refresh").onclick = () => task(async () => { if (state) await restoreSession(state.session_id); });
 $("new-chat").onclick = () => task(async () => setState(await api("/api/sessions", {})));
 $("chat-form").onsubmit = event => {
   event.preventDefault();
   task(async () => {
     if (!state) setState(await api("/api/sessions", {}));
-    const result = await api(`/api/sessions/${state.session_id}/messages`, {content:$("message").value});
+    await streamMessage(state.session_id, $("message").value);
     $("message").value = "";
-    setState(result.session);
   });
 };
 for (const id of ["live", "benchmark"]) $(`${id}-tab`).onclick = () => {
@@ -290,7 +378,7 @@ audit();
 task(async () => {
   const saved = localStorage.getItem("aftersales-session");
   if (saved) {
-    try { setState(await api(`/api/sessions/${saved}`)); }
+    try { await restoreSession(saved); }
     catch { localStorage.removeItem("aftersales-session"); notify("会话不可用，请新建对话。"); }
   }
 });

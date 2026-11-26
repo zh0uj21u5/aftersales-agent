@@ -1,6 +1,6 @@
-# 系统架构 · v1.0
+# 系统架构 · v3.0.0
 
-本文描述 v2.0.0 的实现及 v1.0 基线，历史实验版本以[RESULTS](RESULTS.md)的哈希为准。实现只使用Python3.11、已有SDK/Pydantic与标准库SQLite，不引入Agent编排框架。[PRD](PRD.md)定义产品范围。
+项目使用 Python 3.11 自研 Agent 执行层，不引入任何重型 Agent 编排框架。v1 建立 Guard 硬校验、确认门与双库终态判分；v2 把确认升级为服务端 Proposal 逐字段绑定，加入单库原子提交、动作幂等恢复和双栏审计工作台；v3 在共享规则和整数分金额计算之上增加 PostgreSQL 16 + Redis 7 生产高并发路径，同时完整保留 SQLite 离线评测与工作台。下文先说明 v1、v2 的执行和评测契约，再展开 v3 的生产边界。 [产品范围](PRD.md) · [历史实验](RESULTS.md)
 
 ## 分层与依赖
 
@@ -111,7 +111,7 @@ Agent、确认分类与GoalJudge计Agent目的用量；模拟器用purpose=simul
 
 wheel包含aftersales、evals及SQL/Markdown/YAML资源，排除运行报告。配置、测试与演示脚本从源码仓库使用；CLI默认tasks/config相对当前目录，因此快速上手要求位于仓库根。独立wheel导入与包内资源另做验证。业务时钟固定不影响perf_counter性能计时；trace运行ID用UUID防止固定时间冲突。
 
-默认离线演示真实调用build_agent、PolicyHooks、Services与SQLite，Mock只替换模型；不经.env、不连模型。M4真实链路只用授权的1个chat+5个scripted trial，记录费用、耗时和实际结果；不把演示当成功率实验。M5～M7后续补充了本地Proposal绑定授权、SQLite动作幂等与审计工作台；生产鉴权、外部支付幂等和多租户账户隔离仍待后续设计。
+默认离线演示调用 `build_agent`、`PolicyHooks`、`Services` 和 SQLite，由 Mock 提供模型响应。M4 的真实模型验收使用 1 次聊天与 5 个脚本用户试验，并记录实际结果、费用和耗时。历史实验以报告中的源码哈希为准。 [M4 验收](RESULTS.md#m4-v10--p8-端到端验收2026-11-03)
 
 ## M5～M7 增量：绑定授权、恢复与双栏审计工作台
 
@@ -137,4 +137,40 @@ flowchart LR
 
 实时三方表只把同一Proposal动作与相应执行记录连接，未提交的尝试保留在Trace；字段Diff来自action_executions原始快照，不从模型回复推测。评测Tab只显示报告中的grade.database_diff（Agent缺失Gold行/多余行），终态一致时明确显示空差异。任务完成度、业务正确性和代码拦截是不同证据，不在UI里混为同一“安全率”。
 
-`serve --offline` 注入本地说明型客户端且不读.env；普通serve注入当前配置模型，确认卡API始终开启guard、confirm_gate、proposal_gate。全部自由文本只用DOM文本节点渲染。浏览器session_id仍是本地凭据，未扩展为互联网多租户服务。
+`serve --offline` 注入本地说明型客户端。SQLite 本地模式用会话 ID 访问演示会话，确认卡 API 启用 `guard`、`confirm_gate` 和 `proposal_gate`。自由文本通过 DOM 文本节点渲染。生产 API 的会话身份和归属由 JWT 校验。
+
+## M8～M10 · v3 生产执行
+
+| 边界 | 离线评测与工作台 | 生产 API |
+|---|---|---|
+| 数据与时钟 | SQLite、`FixedClock`、每个评测试验独立双库 | PostgreSQL 16、`WallClock`、原生异步连接池 |
+| 会话与身份 | 进程内按会话互斥，本地演示身份验证 | JWT 绑定会话归属，Redis 令牌租约，PG `revision` 复核 |
+| 结算与审计 | 本地确定性结算，JSONL Trace | 异步渠道与回调，PG 审计表、PII 脱敏及 OpenTelemetry |
+
+```mermaid
+flowchart LR
+    Buyer[买家 · JWT 与 SSE] --> API[FastAPI · 身份与资源归属]
+    Supervisor[主管 · JWT 角色] --> API
+    API --> Redis[(Redis · 租约与用户配额)]
+    API --> Agent[异步 Agent · 规则与 Proposal]
+    Agent --> Router[模型用途分层与主备熔断]
+    Agent --> Tx[行锁复核 · 原子写入与审计]
+    API --> Review[P08 审批]
+    Review --> Tx
+    Tx --> PG[(PostgreSQL · 账本与 Outbox)]
+    PG --> Relay[Outbox Relay]
+    Relay --> Channel[支付与履约适配器]
+    Channel --> Webhook[HMAC 支付回调]
+    Webhook --> PG
+    Reconcile[挂账修复与资金勾稽] --> Channel
+    Reconcile --> PG
+    API -. 脱敏遥测 .-> OTEL[OpenTelemetry]
+```
+
+- **M8 异步回合与流式网关**。SSE 与普通消息接口复用同一套 [`AsyncAgent`](../src/aftersales/core/loop.py)。等待主模型、确认分类器或目标核对前归还数据库连接，做到慢 I/O 期间零连接与零事务持有。写动作在短事务中完成，断连后可沿会话检查点和动作幂等记录恢复。10 个独立会话各等待模拟模型 0.3 秒，并发总耗时 0.560 秒。
+- **M9 强一致并发、多租户身份与可观测性**。[`storage.py`](../src/aftersales/domain/storage.py) 以 `greenlet` 非阻塞桥接 `psycopg` `AsyncConnectionPool`，使 SQLite 与 PostgreSQL 共享同一套业务服务。写入先锁订单，再按 SKU 主键升序加锁，并核对条件原子更新的影响行数。退款同时受原支付方式复合外键、[`pg_schema.sql`](../src/aftersales/domain/pg_schema.sql) 订单额度账本触发器（`reserve_refund()`）和商品行余额约束。[`redis_coord.py`](../src/aftersales/core/redis_coord.py) 维护会话租约、UID 滑动窗口、在途上限、日成本配额及按 PG `revision` 验证的缓存。[`security.py`](../src/aftersales/web/security.py) 与 [`privacy.py`](../src/aftersales/core/privacy.py) 校验 JWT 签名、发行方、受众、角色和资源归属，并对审计日志与 OpenTelemetry 遥测做白名单投影脱敏。20 路抢单只成功 1 笔，40 笔交叉 SKU 订单全部提交且零死锁。
+- **M10 异步结算、自动对账与主管审批闭环**。退款占用、动作记录、前后快照和 [`outbox.py`](../src/aftersales/core/outbox.py) 事件同事务提交。Worker 用 `FOR UPDATE SKIP LOCKED` 领取事件（带数据库租约接续），取消订单须先经履约拦截确认再回补库存与发起退款，并以全局唯一 `execution_key` 作为渠道幂等键，支持指数退避和死信工单。[`webhooks.py`](../src/aftersales/web/webhooks.py) 用 HMAC-SHA256、5 分钟时间窗和事件去重表推进终态，渠道失败保留占用额度并创建人工工单。[`reconciliation.py`](../src/aftersales/domain/reconciliation.py)（`aftersales reconcile`）主动查单修复超时挂账并勾稽渠道完整结算单（发现差异自动阻断该单后续自动打款）。[`admin.py`](../src/aftersales/web/admin.py) 主管审批在锁内复核订单和原申请金额，以 `approval:{id}` 幂等进入同一结算路径并通知原会话。[`llm_router.py`](../src/aftersales/core/llm_router.py) 按 `agent`、`confirmation` 和 `goal_judge` 配置主备熔断链，确认分类器受 3 秒总超时保护。
+
+### v3 封版验证与持久性边界
+
+867 项默认离线测试通过，Windows 与 Linux Compose 各有 18 项真实 PostgreSQL 16 + Redis 7 集成测试通过，两套共 68 题金额重放零差异。在 [`scripts/load_test.py`](../scripts/load_test.py) 的 20 路并发、60 操作混合故障压测中，Linux Compose 端到端 P50 为 98.98 ms，P95 从优化前的 1061.97 ms 降至 618.74 ms。首笔审批事务应用 SQL 由 21 条减至 11 条：新建 Schema 冷态首笔约 35 ms（Linux）/ 47 ms（Windows，含首次表目录加载、7 表 JSONB 快照计划编译与 PL/pgSQL 触发器编译），预热稳态下第 2 笔的 11 条业务 SQL 合计约 11.8 ms，其余约 8～12 ms 为 `COMMIT` 阶段的延迟外键闭环校验与 Docker 卷 `synchronous_commit=on` WAL 物理刷盘耗时。生产账本严格保留 `synchronous_commit=on`、延迟外键与事务内前后快照，确保资金占用、动作证据与 Outbox 拥有同一持久化边界。

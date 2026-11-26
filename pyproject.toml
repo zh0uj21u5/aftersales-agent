@@ -1,6 +1,6 @@
 [project]
 name = "aftersales-agent"
-version = "2.0.1"
+version = "3.0.0"
 description = "An e-commerce after-sales & order fulfillment agent that executes write operations under hard-checked policy."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -18,6 +18,16 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "ruff>=0.6", "httpx>=0.27"]
+prod = [
+    "httpx>=0.27",
+    "psycopg[binary,pool]>=3.2,<4",
+    "greenlet>=3.1,<4",
+    "redis>=5.2,<8",
+    "PyJWT[crypto]>=2.10,<3",
+    "opentelemetry-api>=1.30,<2",
+    "opentelemetry-sdk>=1.30,<2",
+    "opentelemetry-exporter-otlp-proto-http>=1.30,<2",
+]
 
 [project.scripts]
 aftersales = "aftersales.cli:app"
@@ -37,8 +47,11 @@ exclude = ["evals/reports/**", "src/aftersales/web/static/**", "src/aftersales/w
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["llm: real-model smoke tests (requires credentials and network)"]
-addopts = "-m 'not llm'"
+markers = [
+    "llm: real-model smoke tests (requires credentials and network)",
+    "integration: real PostgreSQL and Redis tests",
+]
+addopts = "-m 'not llm and not integration'"
 
 [tool.ruff]
 line-length = 100

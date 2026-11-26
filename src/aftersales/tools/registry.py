@@ -4,20 +4,22 @@ from __future__ import annotations
 
 import inspect
 import json
-import sqlite3
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping, MutableMapping
 from dataclasses import dataclass
 from datetime import datetime
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, Protocol, get_type_hints
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, create_model
 
 from aftersales.core.config import AgentConfig
+from aftersales.domain.db import DbConnection
 from aftersales.domain.services import PolicyError, Services
 
 if TYPE_CHECKING:
     from aftersales.core.context import TodoItem
     from aftersales.core.llm import Message
+    from aftersales.policy.confirmation import ConfirmationState
     from aftersales.policy.proposal import ActionProposal, ProposedAction
 
 TOOL_OUTPUT_MAX_CHARS = 8000
@@ -26,17 +28,11 @@ TOOL_OUTPUT_MAX_CHARS = 8000
 class SessionState(Protocol):
     session_id: str
     proposals: list[ActionProposal]
-    presented_proposal_version: int | None
+    confirmation: ConfirmationState
     messages: list[Message]
     todo: list[TodoItem]
     authenticated_user_id: str | None
     closed: bool
-    confirmation_user_index: int
-    confirmation_available: bool
-    confirmation_checked: bool
-    confirmation_identity: str | None
-    confirmation_proposal: str
-    confirmed_batch: bool
 
     def persist(self) -> None: ...
 
@@ -49,12 +45,13 @@ class ClockSource(Protocol):
 class ToolContext:
     session: SessionState
     config: AgentConfig
-    db: sqlite3.Connection | None = None
+    db: DbConnection | None = None
     clock: ClockSource | None = None
     execution_id: str | None = None
     authorized_action: ProposedAction | None = None
     tool_call_id: str | None = None
     result_checkpointed: bool = False
+    model_io_prepared: bool = False
 
     def services(self) -> Services:
         if self.db is None or self.clock is None:
@@ -138,17 +135,23 @@ def tool(
 
 class ToolRegistry:
     def __init__(self, functions: Iterable[Callable[..., Any]] = ()) -> None:
-        self._tools: dict[str, RegisteredTool] = {}
+        self._tools: Mapping[str, RegisteredTool] = {}
         for function in functions:
             self.register(function)
 
     def register(self, function: Callable[..., Any]) -> None:
+        if not isinstance(self._tools, MutableMapping):
+            raise TypeError("Tool registry is frozen")
         registered = getattr(function, "__registered_tool__", None)
         if not isinstance(registered, RegisteredTool):
             raise TypeError("Register a function decorated with @tool")
         if registered.spec.name in self._tools:
             raise ValueError(f"Duplicate tool: {registered.spec.name}")
         self._tools[registered.spec.name] = registered
+
+    def freeze(self) -> ToolRegistry:
+        self._tools = MappingProxyType(self._tools)
+        return self
 
     def specs(self) -> list[ToolSpec]:
         return [entry.spec.model_copy(deep=True) for entry in self._tools.values()]

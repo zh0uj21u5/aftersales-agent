@@ -1,8 +1,18 @@
-# 售后管家 · aftersales-agent
+# 售后管家 · aftersales-agent v3.0.0
 
 在 15 条电商平台售后规则（`P01～P15`）硬约束下，直接操作事务执行**改地址、取消订单、价保退差、无理由退货、同款换货、重新下单**与**大额审批/转人工**的交易执行型 Agent。
 
-采用 **Python 3.11 + SQLite + FastAPI** 构建，**不使用任何 Agent 编排框架**（无 LangChain / LlamaIndex / AutoGen / CrewAI）：模型适配层、Agent 循环、工具注册、规则防线、参数级提案绑定（`ActionProposal`）、单事务幂等恢复、双栏实时审计工作台与仿 [tau-bench](https://github.com/sierra-research/tau-bench) 双库终态评测集（60 题）全部自研。支付、物流与人工审批均为本地确定性模拟，所有金额统一以**整数分（`int`）**存储与计算，业务时钟固定为 `2026-11-15T12:00:00+08:00`。
+用 **Python 3.11** 自研模型适配、Agent 循环、工具注册、规则校验和提案绑定。离线模式使用 SQLite、固定时钟与模拟渠道，支持双栏审计工作台和双库终态评测。生产模式使用 FastAPI、PostgreSQL 16、Redis 7 与可配置的支付、履约适配器。两种模式共享业务校验及整数分计算。 [双库评测方法参考 tau-bench](https://github.com/sierra-research/tau-bench)
+
+## 从 v1 到 v3
+
+| 版本 | 能力 | 验证记录 |
+|---|---|---|
+| v1 · 规则与评测 | Guard 与确认门约束写操作。双库分别记录 Agent 实际执行与 Gold 动作重放，以业务终态判分。 | P7-A Flash 固定 8 题各运行 3 次，`pass^1` 83.33%，`pass^3` 62.50%。 |
+| v2 · 授权与审计 | 服务端 Proposal 绑定身份、版本、参数和业务前提。SQLite 单事务提交业务写入、幂等记录和会话检查点。双栏工作台展示实况与回放。 | 60 题 C 组 `pass^1` 96.67%，终态正确率 99.44%，成功写入中未确认操作 0 次。 |
+| v3 · 生产执行 | 异步 SSE、PostgreSQL 行锁与账本触发器、Redis 租约与用户配额、JWT 归属校验与脱敏、Transactional Outbox、自动勾稽对账、多模型熔断及主管审批。 | 867 项离线测试通过，两端各 18 项真实 PostgreSQL/Redis 集成通过。68 题金额重放零差异。 |
+
+[版本架构](docs/ARCHITECTURE.md) · [历史模型实验](docs/RESULTS.md) · [v3 生产架构细节](docs/ARCHITECTURE.md#m8m10--v3-生产执行)
 
 ---
 
@@ -58,7 +68,7 @@
 
 ---
 
-## 系统架构与四道工程防线
+## 离线执行、双库评测与四道工程防线
 
 ```mermaid
 flowchart TD
@@ -112,7 +122,7 @@ flowchart TD
 - **注入指标与严谨边界说明**：
   - 在全量 60 题三组对照中，12 道注入专项题（`t029～t040`）三组均为 **`0/36`** 次注入成功；全标签 13 道注入题（39 会话）中，正式影子报告标记 A/B/C 为 `3/39`、`0/39`、`3/39`，其中 A 与 C 的标记均来自 `t060` 合法新购 `S0002` 时模型显式传入了默认收货地址与空券（与省略默认值的 Gold 字面不等），经 Schema 默认值与种子库默认地址规范化复核，**三组实际越权读取与 Gold 范围外成功写入均为 `0/39`**。
   - 因此，本项目**不宣称**在该样本集上测得了注入成功率的统计显著下降；代码防线已被实证证明的核心收益在于**将未确认写入从 60 次清零，并在执行层硬性阻断参数篡改、金额错配（如 `t057`）与越权读写（如 B 组 2 次真实 `P01` 拦截）**。
-  - 本仓库为单机原型，支付、物流与本地 `session_id` 均非生产级多租户鉴权或跨系统分布式事务。
+  - 540 会话对照运行在 SQLite 单机模式，支付和物流使用本地业务记录。
 
 ---
 
@@ -129,12 +139,14 @@ python -c "import sys; assert sys.version_info[:2] == (3, 11), '需要 Python 3.
 python -m venv .venv
 .venv\Scripts\python.exe -m pip install -e ".[dev]" -i https://pypi.tuna.tsinghua.edu.cn/simple
 
-# 无需 .env 即可运行离线演示、845 项单测、代码检查与 60 题金额重放校验
+# 无需 .env 即可运行离线演示、867 项测试及两套共 68 题的金额重放校验
 .venv\Scripts\aftersales.exe --help
 .venv\Scripts\python.exe scripts/demo.py
 .venv\Scripts\python.exe -m pytest -q
 .venv\Scripts\python.exe -m ruff check src tests evals scripts
+.venv\Scripts\python.exe -m ruff format --check src tests evals scripts
 .venv\Scripts\python.exe scripts/gen_expectations.py --check
+.venv\Scripts\python.exe scripts/gen_expectations.py --tasks evals/tasks_v2 --check
 ```
 
 ### 2. 连接真实模型体验 CLI 对话、Trace 渲染与小样本评测
@@ -164,24 +176,46 @@ $chatTrace = Get-ChildItem "$runRoot/chat-traces/*.jsonl" | Select-Object -First
 
 ---
 
+## v3 生产 API 与实测
+
+安装 `.[prod]`，用 `docker compose up -d` 启动本地依赖，再用 `docker compose wait migrate` 等待初始化与种子灌入完成。按 `.env.example` 配置数据库、Redis 和 JWT，执行 `aftersales serve --mode prod`。API 客户端以 Bearer 令牌访问会话、流式消息、确认与审计分页。离线评测与本地工作台走原有 SQLite 路径。 [JWT 鉴权实现](src/aftersales/web/security.py) · [异步存储桥接](src/aftersales/domain/storage.py) · [Redis 协调与配额](src/aftersales/core/redis_coord.py)
+
+M10 的异步退款和履约通过配置的渠道适配服务执行。已有 M9 库先执行 `python -m aftersales.domain.migrate`。主管可处理 P08 审批与人工工单，`aftersales reconcile` 查询挂账并对账。用 `/healthz` 和 `/readyz` 检查运行状态。 [Outbox 投递](src/aftersales/core/outbox.py) · [自动勾稽对账](src/aftersales/domain/reconciliation.py) · [主管审批接口](src/aftersales/web/admin.py)
+
+- **异步并发**。10 个独立会话各等待模拟模型 0.3 秒，总耗时 0.560 秒。同一会话争用返回 `409`，模型等待期间归还数据库连接。 [异步回合实现](src/aftersales/core/loop.py)
+- **交易一致性**。单件库存的 20 路抢单仅 1 笔成功。用券、价保、退货的 10 路争用各 1 笔成功。40 笔交叉 SKU 订单全部提交，零死锁。 [PG 账本 Schema](src/aftersales/domain/pg_schema.sql) · [增量迁移 v2](src/aftersales/domain/pg_migration_2.sql)
+- **退款与审批**。60 操作、20 路并发的混合故障压测，Linux Compose 的端到端 P50 为 98.98 ms，P95 为 618.74 ms（优化前基线 P95 为 1061.97 ms）。三次渠道尝试只产生一笔 ¥450.00 退款，零死信。首笔审批由 21 条应用 SQL 降至 11 条（预热稳态业务 SQL 合计约 11.8 ms），保留事务前后快照与 `synchronous_commit=on`。 [混合压测脚本](scripts/load_test.py) · [持久性架构说明](docs/ARCHITECTURE.md#v3-封版验证与持久性边界)
+
+可用 `LLM_ROUTING_CONFIG` 指向 YAML 文件。按需配置三类用途，列表顺序决定主备。密钥从 `key_env` 指定的环境变量读取。
+
+```yaml
+agent:
+  - {provider: openai, model: gpt-4.1-mini, key_env: OPENAI_API_KEY}
+  - {provider: deepseek, model: deepseek-v4-flash, key_env: DEEPSEEK_API_KEY, base_url: "https://api.deepseek.com"}
+confirmation:
+  - {provider: openai, model: gpt-4.1-mini, key_env: OPENAI_API_KEY, timeout_seconds: 3}
+goal_judge:
+  - {provider: openai, model: gpt-4.1-mini, key_env: OPENAI_API_KEY}
+```
+
 ## 目录结构与文档导航
 
 ```text
 src/aftersales/
-  cli.py             CLI 入口：seed / chat / trace / eval / serve
-  core/              llm / config / runtime / loop / hooks / context / goal_judge / execution / session_store / tracing
+  cli.py             CLI 入口：seed / chat / trace / eval / serve / reconcile
+  core/              异步循环 / Proposal 执行 / 会话与 Trace / Redis 协调 / Outbox / 模型熔断
   policy/            POLICY.md（P01～P15） / guard.py / proposal.py / proposal_text.py / confirmation.py
   tools/             registry / auth / query / write / escalate / proposal
-  domain/            clock / schema.sql / seed / db / models / services / calculator
+  domain/            规则与金额 / SQLite 与 PostgreSQL / 增量迁移 / 渠道与对账
   prompts/           system.md / proposal.md
-  web/               app.py / demos.py / static（原生 HTML·CSS·JS） / samples（内置回放报告）
+  web/               FastAPI / SSE / JWT / 支付回调 / 主管审批 / 离线工作台
 configs/             baseline / guard_only / guard / on_demand / todo / goal_judge / full / proposal / proposal_llm
-evals/               tasks（t001～t060） / runner / simulator / scripted / state / replay / audit / grader / taxonomy
-scripts/             demo.py / gen_expectations.py / replay_confirmations.py / run_step_b.py / run_step_c.py / analyze_step_c.py
-tests/               845 项默认离线单测与集成测试；llm 标记需显式选择运行
+evals/               tasks（60 题） / tasks_v2（8 题） / 模拟器 / 双库判分与审计
+scripts/             demo.py / gen_expectations.py / load_test.py / 实验运行与复核
+tests/               867 项默认离线测试 / 18 项 PostgreSQL 与 Redis 集成测试 / LLM 冒烟
 docs/                产品需求、系统架构与实验报告
 ```
 
 - [RESULTS.md：全量实验指标、分层表现、成本账本与工件哈希](docs/RESULTS.md)
-- [ARCHITECTURE.md：分层契约、提案绑定、幂等恢复与双库判分架构](docs/ARCHITECTURE.md)
+- [ARCHITECTURE.md · v1–v3 演进、双模式与生产事务](docs/ARCHITECTURE.md)
 - [PRD.md：业务范围、15 条平台规则定义与验收口径](docs/PRD.md) · [POLICY.md：P01～P15 规则原文](src/aftersales/policy/POLICY.md)

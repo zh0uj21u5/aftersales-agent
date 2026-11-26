@@ -1,8 +1,10 @@
 """CLI entry points for seeded conversations, traces and future evaluation."""
 
 import sys
+from collections.abc import Iterator
+from contextlib import closing, contextmanager
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import typer
 import yaml
@@ -13,8 +15,8 @@ from rich.text import Text
 
 from aftersales.core.config import AgentConfig, load_settings
 from aftersales.core.llm import make_client
-from aftersales.core.loop import Session
-from aftersales.core.runtime import build_agent
+from aftersales.core.loop import Agent, Session
+from aftersales.core.runtime import build_async_agent
 from aftersales.core.session_store import SessionStore
 from aftersales.core.tracing import TraceWriter, render_trace, trace_path
 from aftersales.domain.clock import FixedClock
@@ -66,35 +68,45 @@ def chat(
         options = AgentConfig.model_validate({**settings.agent_config().model_dump(), **overrides})
     except (OSError, ValueError, yaml.YAMLError) as exc:
         raise typer.BadParameter("请检查 .env 或配置文件（模型、凭据及配置项）") from exc
-    connection = connect(db)
+    clock = FixedClock()
+
+    @contextmanager
+    def access(*, initialize: bool = False) -> Iterator[SessionStore]:
+        with closing(connect(db)) as connection:
+            yield SessionStore(connection, clock, initialize=initialize)
+
     writer = None
     reason = "exit"
     try:
-        columns = list(connection.execute("PRAGMA table_info(handoffs)"))
-        if not columns or any(row[1] == "user_id" and row[3] for row in columns):
-            raise typer.BadParameter("数据库 schema 早于 P3，请用 seed --db <新路径> 生成新库")
+        with closing(connect(db)) as connection:
+            columns = list(connection.execute("PRAGMA table_info(handoffs)"))
+            if not columns or any(row[1] == "user_id" and row[3] for row in columns):
+                raise typer.BadParameter("数据库 schema 早于 P3，请用 seed --db <新路径> 生成新库")
         llm = make_client(options.provider, options.model)
         classifier = make_client(options.provider, confirm_model) if confirm_model else None
-        clock = FixedClock()
-        store = SessionStore(connection, clock)
-        if session_id is not None:
-            try:
-                session = store.load(session_id)
-            except KeyError as exc:
-                raise typer.BadParameter("会话不存在", param_hint="--session") from exc
-        else:
-            session = Session()
-            store.save(session)
-        writer = TraceWriter(clock, trace_dir)
-        store.attach_trace(session.session_id, writer.run_id)
-        agent = build_agent(
-            connection,
-            clock,
-            llm,
-            options,
-            writer,
-            classifier=classifier,
-            classifier_model=confirm_model,
+        with access(initialize=True) as store:
+            if session_id is not None:
+                try:
+                    session = store.load(session_id, attach=False)
+                except KeyError as exc:
+                    raise typer.BadParameter("会话不存在", param_hint="--session") from exc
+            else:
+                session = Session()
+                store.save(session)
+                session._store = None
+            writer = TraceWriter(clock, trace_dir)
+            store.attach_trace(session.session_id, writer.run_id)
+        agent = Agent(
+            engine=build_async_agent(
+                access,
+                clock,
+                llm,
+                options,
+                writer,
+                classifier=classifier,
+                classifier_model=confirm_model,
+                prompt_cache_pricing=False,
+            )
         )
         console = Console()
         console.print(f"售后管家 · run_id={writer.run_id} · 输入 /exit 退出", markup=False)
@@ -131,7 +143,6 @@ def chat(
     finally:
         if writer:
             writer.close(reason)
-        connection.close()
 
 
 @app.command()
@@ -240,34 +251,128 @@ def serve(
     ),
     port: Annotated[int, typer.Option(min=1, max=65535)] = 8000,
     offline: Annotated[bool, typer.Option(help="Offline demos; never load credentials")] = False,
+    mode: Annotated[
+        Literal["local", "prod"] | None, typer.Option(help="Storage and security mode")
+    ] = None,
 ) -> None:
-    """Start the local audit workbench (single worker, loopback only)."""
+    """Start the HTTP gateway on loopback."""
+    import asyncio
+    import os
+
     import uvicorn
+    from dotenv import dotenv_values
 
     from aftersales.web.app import create_app
 
-    if not db.is_file():
+    environment = {} if offline else {**dotenv_values(".env"), **os.environ}
+    production = None
+    configured = False
+    if mode is None and not offline:
+        configured = any(environment.get(key) for key in ("DATABASE_URL", "REDIS_URL"))
+    if mode == "prod" and offline:
+        raise typer.BadParameter("生产模式与离线演示不能同时启用", param_hint="--mode")
+    if mode == "prod" or configured:
+        from aftersales.web.production import ProductionSettings
+
+        production = ProductionSettings.from_env()
+    if production is None and not db.is_file():
         raise typer.BadParameter("数据库不存在，请先 seed", param_hint="--db")
-    from aftersales.core.llm import LLMResponse
+    from aftersales.core.llm import LLMResponse, make_async_client
 
     class OfflineClient:
-        def chat(self, *args: Any, **kwargs: Any) -> LLMResponse:
+        async def chat(self, *args: Any, **kwargs: Any) -> LLMResponse:
             return LLMResponse(
                 text="当前为纯离线模式。请使用演示场景的下一步或确认卡按钮；自由消息已保存。真实客服对话请不带 --offline 启动。"
             )
 
+    router = None
+    routing_path = environment.get("LLM_ROUTING_CONFIG") if production is not None else None
     if offline:
         options = AgentConfig(proposal_gate=True)
         client = OfflineClient()
+    elif routing_path:
+        from aftersales.core.llm_router import load_router
+
+        router = load_router(routing_path, environment)
+        primary = router.chains["agent"][0]
+        options = AgentConfig(
+            provider=primary.provider,
+            model=primary.model,
+            proposal_gate=True,
+            confirm_mode="llm" if "confirmation" in router.chains else "heuristic",
+            goal_judge="goal_judge" in router.chains,
+            max_steps=int(environment.get("MAX_STEPS") or 30),
+            tool_output_max_chars=int(environment.get("TOOL_OUTPUT_MAX_CHARS") or 8000),
+        )
+        client = primary.client
     else:
         settings = load_settings()
         options = settings.agent_config().model_copy(update={"proposal_gate": True})
-        client = make_client(options.provider, options.model)
-    uvicorn.run(
-        create_app(db, client, options),
-        host="127.0.0.1",
-        port=port,
+        client = make_async_client(options.provider, options.model)
+    gateway = create_app(
+        db if production is None else None,
+        client,
+        options,
+        production=production,
+        model_router=router,
     )
+    if production is not None and sys.platform == "win32":
+        server = uvicorn.Server(
+            uvicorn.Config(
+                gateway,
+                host="127.0.0.1",
+                port=port,
+                timeout_graceful_shutdown=35,
+            )
+        )
+        with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+            runner.run(server.serve())
+    elif production is not None:
+        uvicorn.run(gateway, host="127.0.0.1", port=port, timeout_graceful_shutdown=35)
+    else:
+        uvicorn.run(gateway, host="127.0.0.1", port=port)
+
+
+@app.command("reconcile")
+def reconcile_command(
+    hanging_seconds: Annotated[int, typer.Option(min=1)] = 300,
+    statement_lag_seconds: Annotated[int, typer.Option(min=0)] = 300,
+) -> None:
+    """Repair stale refunds and compare the closed channel statement."""
+    import asyncio
+    import os
+    from datetime import timedelta
+
+    from dotenv import dotenv_values
+
+    from aftersales.domain.clock import WallClock
+    from aftersales.domain.gateways import GatewaySettings, open_gateways
+    from aftersales.domain.reconciliation import reconcile
+    from aftersales.domain.storage import PostgresStorage
+
+    values = {**dotenv_values(".env"), **os.environ}
+    database = values.get("DATABASE_URL")
+    gateways = GatewaySettings.from_values(values)
+    if not database or not gateways.payment_url or gateways.sandbox:
+        raise typer.BadParameter("需要 DATABASE_URL 和可持久查询的 PAYMENT_GATEWAY_URL")
+    clock = WallClock()
+    storage = PostgresStorage(database)
+
+    async def run() -> None:
+        async with storage.pool, open_gateways(gateways, clock) as (payment, _):
+            assert payment is not None
+            report = await reconcile(
+                storage,
+                clock,
+                payment,
+                hanging_age=timedelta(seconds=hanging_seconds),
+                statement_lag=timedelta(seconds=statement_lag_seconds),
+            )
+        typer.echo(report.model_dump_json())
+
+    loop_factory = asyncio.SelectorEventLoop if sys.platform == "win32" else None
+    with asyncio.Runner(loop_factory=loop_factory) as runner:
+        runner.run(run())
 
 
 if __name__ == "__main__":

@@ -13,7 +13,10 @@ from pydantic import ValidationError
 
 from aftersales.core.config import load_settings
 from aftersales.core.llm import (
+    PROMPT_RUNTIME_BOUNDARY,
     AnthropicClient,
+    AsyncAnthropicClient,
+    AsyncOpenAICompatClient,
     CachedClient,
     LLMResponse,
     Message,
@@ -23,6 +26,7 @@ from aftersales.core.llm import (
     Usage,
     estimate_cost,
     make_client,
+    run_sync,
 )
 from aftersales.core.loop import Agent, Session
 from aftersales.tools.registry import ToolContext, ToolRegistry, ToolSpec, tool
@@ -160,7 +164,9 @@ def test_anthropic_sdk_roundtrip_groups_tool_results_and_preserves_errors() -> N
     response = client.chat("规则", transcript(), [SPEC])
     assert response.text == "第一段\n第二段" and response.stop_reason == "tool_use"
     assert response.tool_calls[0].arguments == {"text": "你好"}
-    assert response.usage == Usage(input_tokens=16, output_tokens=3)
+    assert response.usage == Usage(
+        input_tokens=16, output_tokens=3, cached_tokens=4, cache_creation_tokens=2
+    )
     assert response.raw["id"] == "msg_1"
     request = received[0]
     assert request["system"] == "规则"
@@ -511,3 +517,193 @@ def test_real_model_echo_tool_then_answer() -> None:
     assert seen == ["P1_ECHO_OK"]
     assert result.stop_reason == "end_turn" and "P1_ECHO_OK" in result.reply
     assert result.usage.input_tokens > 0 and result.usage.output_tokens > 0
+
+
+@pytest.mark.parametrize("finish", ["stop", "length"])
+def test_async_openai_sse_chunks_retry_and_cached_usage(finish: str) -> None:
+    requests: list[dict[str, Any]] = []
+    delays: list[float] = []
+
+    def chunk(choices: list[dict[str, Any]], **extra: Any) -> str:
+        return (
+            "data: "
+            + json.dumps(
+                {
+                    "id": "stream_1",
+                    "object": "chat.completion.chunk",
+                    "created": 0,
+                    "model": "test",
+                    "choices": choices,
+                    **extra,
+                }
+            )
+            + "\n\n"
+        )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        if len(requests) < 3:
+            return httpx.Response(429, json={"error": {"message": "offline rate limit"}})
+        body = "".join(
+            [
+                chunk(
+                    [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": "你好"},
+                            "finish_reason": None,
+                        }
+                    ]
+                ),
+                chunk([{"index": 0, "delta": {"content": "。"}, "finish_reason": None}]),
+                chunk([{"index": 0, "delta": {}, "finish_reason": finish}]),
+                chunk(
+                    [],
+                    usage={
+                        "prompt_tokens": 10,
+                        "completion_tokens": 3,
+                        "total_tokens": 13,
+                        "prompt_tokens_details": {"cached_tokens": 4},
+                    },
+                ),
+                "data: [DONE]\n\n",
+            ]
+        )
+        return httpx.Response(200, text=body, headers={"content-type": "text/event-stream"})
+
+    async def sleep(delay: float) -> None:
+        delays.append(delay)
+
+    async def check() -> LLMResponse:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            sdk = openai.AsyncOpenAI(
+                api_key="unit",
+                base_url="https://unit.test",
+                max_retries=0,
+                http_client=http,
+            )
+            adapter = AsyncOpenAICompatClient("test", "unit", sdk=sdk, sleep=sleep)
+            return await adapter.stream_chat(
+                "稳定规则", transcript(), [SPEC], 0.0, 10, deltas.append
+            )
+
+    deltas: list[str] = []
+    response = run_sync(check())
+    assert delays == [1, 2] and deltas == ["你好", "。"]
+    assert response.text == "你好。"
+    assert response.stop_reason == ("end_turn" if finish == "stop" else "max_tokens")
+    assert response.usage == Usage(input_tokens=10, output_tokens=3, cached_tokens=4)
+    assert requests[-1]["stream_options"] == {"include_usage": True}
+    assert requests[-1]["messages"][0] == {"role": "system", "content": "稳定规则"}
+
+
+def test_async_anthropic_sse_preserves_cache_boundary_and_usage() -> None:
+    requests: list[dict[str, Any]] = []
+    deltas: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        events = [
+            {
+                "type": "message_start",
+                "message": {
+                    **anthropic_payload(),
+                    "content": [],
+                    "stop_reason": None,
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 0,
+                        "cache_creation_input_tokens": 2,
+                        "cache_read_input_tokens": 4,
+                    },
+                },
+            },
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            },
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "答复。"},
+            },
+            {"type": "content_block_stop", "index": 0},
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "usage": {"output_tokens": 3},
+            },
+            {"type": "message_stop"},
+        ]
+        body = "".join(f"event: {item['type']}\ndata: {json.dumps(item)}\n\n" for item in events)
+        return httpx.Response(200, text=body, headers={"content-type": "text/event-stream"})
+
+    async def check() -> LLMResponse:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            sdk = anthropic.AsyncAnthropic(
+                api_key="unit",
+                base_url="https://unit.test",
+                max_retries=0,
+                http_client=http,
+            )
+            adapter = AsyncAnthropicClient("test", "unit", sdk=sdk)
+            return await adapter.stream_chat(
+                "系统提示和政策" + PROMPT_RUNTIME_BOUNDARY + "业务当前时间",
+                transcript(),
+                [SPEC],
+                0.0,
+                64,
+                deltas.append,
+            )
+
+    result = run_sync(check())
+    assert result.text == "答复。" and deltas == ["答复。"]
+    assert result.stop_reason == "end_turn"
+    assert requests[0]["system"] == [
+        {"type": "text", "text": "系统提示和政策", "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": "业务当前时间"},
+    ]
+    assert result.usage == Usage(
+        input_tokens=16,
+        output_tokens=3,
+        cached_tokens=4,
+        cache_creation_tokens=2,
+    )
+    # 10 uncached * $1 + 4 reads * $0.10 + 2 writes * $1.25 + 3 output * $5.
+    assert estimate_cost("claude-haiku-4-5-20251001", result.usage, prompt_cache=True) == Decimal(
+        "0.0000279"
+    )
+    assert estimate_cost("claude-haiku-4-5-20251001", result.usage) == Decimal("0.000031")
+
+
+def test_async_deepseek_compatible_prompt_cache_hit_field() -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        payload = openai_payload()
+        payload["usage"].update(prompt_cache_hit_tokens=6, prompt_cache_miss_tokens=4)
+        return httpx.Response(200, json=payload)
+
+    async def check() -> LLMResponse:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            sdk = openai.AsyncOpenAI(
+                api_key="unit",
+                base_url="https://unit.test",
+                max_retries=0,
+                http_client=http,
+            )
+            return await AsyncOpenAICompatClient("test", "unit", sdk=sdk).chat(
+                "规则",
+                transcript(),
+                [SPEC],
+            )
+
+    assert run_sync(check()).usage == Usage(input_tokens=10, output_tokens=3, cached_tokens=6)
+
+
+def test_sync_retry_sleep_uses_the_sync_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    from aftersales.core.llm import _sync_sleep
+
+    delays: list[float] = []
+    monkeypatch.setattr("aftersales.core.llm.time.sleep", delays.append)
+    _sync_sleep(1.0)
+    assert delays == [1.0]

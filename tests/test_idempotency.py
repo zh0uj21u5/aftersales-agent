@@ -8,7 +8,6 @@ from typing import Any
 
 import pytest
 
-from aftersales.core import execution
 from aftersales.core.config import AgentConfig
 from aftersales.core.execution import execute_action, execute_proposal, list_executions
 from aftersales.core.llm import Message, ToolCall
@@ -142,7 +141,7 @@ def test_commit_succeeds_but_response_and_memory_sync_are_lost(
         def crash(*args: Any) -> None:
             raise RuntimeError("process interrupted after commit")
 
-        patch.setattr(execution, "_sync", crash)
+        patch.setattr(Session, "restore_checkpoint", crash)
         with pytest.raises(RuntimeError):
             run(ctx)
     assert ctx.session.proposals[-1].status == "approved"
@@ -171,7 +170,7 @@ def test_committed_checkpoint_contains_tool_reply_before_response_is_returned(
         def crash(*args: Any) -> None:
             raise RuntimeError("response lost")
 
-        patch.setattr(execution, "_sync", crash)
+        patch.setattr(Session, "restore_checkpoint", crash)
         with pytest.raises(RuntimeError):
             run(ctx)
     restored = ctx.session._store.load(ctx.session.session_id)

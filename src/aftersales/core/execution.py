@@ -8,10 +8,10 @@ from pydantic import BaseModel
 
 from aftersales.core.loop import Session
 from aftersales.core.session_store import SessionConflict, SessionStore
-from aftersales.core.tracing import TraceWriter
-from aftersales.domain.db import transaction
+from aftersales.core.tracing import TraceSink
+from aftersales.domain.db import is_postgres, transaction
 from aftersales.domain.models import BusinessSnapshot, OperationResult
-from aftersales.domain.services import PolicyError
+from aftersales.domain.services import PolicyError, Services
 from aftersales.policy.proposal import (
     _fail,
     bind_action,
@@ -24,7 +24,7 @@ from aftersales.tools.registry import ToolContext, ToolRegistry, ToolResult, too
 
 class ActionExecution(BaseModel):
     execution_key: str
-    session_id: str
+    session_id: str | None
     proposal_id: str
     action_id: str
     version: int
@@ -45,8 +45,9 @@ def canonical_json(value: Any) -> str:
 
 def list_executions(store: SessionStore, session_id: str) -> list[ActionExecution]:
     result = []
+    order = "execution_seq" if is_postgres(store.db) else "rowid"
     for row in store.db.execute(
-        "SELECT * FROM action_executions WHERE session_id=? ORDER BY rowid", (session_id,)
+        f"SELECT * FROM action_executions WHERE session_id=? ORDER BY {order}", (session_id,)
     ):
         record = dict(row)
         for key in ("canonical_args", "result", "before_snapshot", "after_snapshot"):
@@ -55,18 +56,27 @@ def list_executions(store: SessionStore, session_id: str) -> list[ActionExecutio
     return result
 
 
-def _sync(target: Session, source: Session) -> None:
-    # Preserve references held by hooks and callers to existing proposal/action objects.
-    old = {p.proposal_id: p for p in target.proposals}
-    for proposal in source.proposals:
-        if proposal.proposal_id in old:
-            current = old[proposal.proposal_id]
-            for action, new in zip(current.actions, proposal.actions, strict=True):
-                action.status = new.status
-            current.status, current.confirm_source = proposal.status, proposal.confirm_source
-    target.__dict__.update(source.__dict__)
-    target.proposals = [old.get(p.proposal_id, p) for p in source.proposals]
-    target._revision, target._store = source._revision, source._store
+def persist_execution(store: SessionStore, record: ActionExecution) -> None:
+    store.db.execute(
+        """INSERT INTO action_executions (execution_key, session_id, proposal_id,
+           action_id, version, tool_name, canonical_args_json, args_hash, result_json,
+           before_snapshot_json, after_snapshot_json, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            record.execution_key,
+            record.session_id,
+            record.proposal_id,
+            record.action_id,
+            record.version,
+            record.tool_name,
+            canonical_json(record.canonical_args),
+            record.args_hash,
+            record.result.model_dump_json(),
+            record.before_snapshot.model_dump_json(),
+            record.after_snapshot.model_dump_json(),
+            record.created_at,
+        ),
+    )
 
 
 def execute_action(
@@ -80,14 +90,16 @@ def execute_action(
     """Replay only explicit action retries; ordinary tool calls still pass PolicyHooks first."""
     if not isinstance(ctx.session, Session) or ctx.db is None or ctx.clock is None:
         raise RuntimeError("Action execution requires a concrete Session, database and clock")
-    if ctx.db.in_transaction:
+    if ctx.db.in_transaction and not is_postgres(ctx.db):
         raise RuntimeError("Action execution must own the outer transaction")
     session = ctx.session
     store = session._store or SessionStore(ctx.db, ctx.clock)
     if store.db is not ctx.db:
         raise RuntimeError("Session and business writes must share one connection")
     key = (session.session_id, proposal_id, action_id)
+    execution_key = hashlib.sha256(canonical_json(key).encode()).hexdigest()
     with transaction(ctx.db):
+        store.lock_checkpoint(session)
         existing = ctx.db.execute(
             """SELECT * FROM action_executions
             WHERE session_id=? AND proposal_id=? AND action_id=?""",
@@ -135,10 +147,13 @@ def execute_action(
             ):
                 raise _fail("方案标识或版本不匹配")
             work = ToolContext(draft, ctx.config, ctx.db, ctx.clock)
-            action = bind_action(work, tool_name, args)
-            if action.action_id != action_id:
-                raise _fail("动作标识与授权不匹配")
-            service = work.services()
+            postgres = is_postgres(ctx.db)
+            service = Services(
+                ctx.db,
+                ctx.clock,
+                enforce_policy=ctx.config.guard,
+                execution_key=execution_key if postgres else None,
+            )
             sku_ids = [item.sku_id for item in args.items] if tool_name == "create_order" else []
             if tool_name == "request_exchange":
                 sku_ids.append(args.new_sku_id)
@@ -146,9 +161,17 @@ def execute_action(
                 "sku_ids": sku_ids,
                 "user_coupon_id": getattr(args, "user_coupon_id", None),
             }
-            before = service.action_snapshot(getattr(args, "order_id", None), **snapshot_args)
-            kwargs = {name: getattr(args, name) for name in type(args).model_fields}
-            result = getattr(service, tool_name)(**kwargs)
+            with service.lock_action_resources(
+                getattr(args, "order_id", None),
+                sku_ids,
+                snapshot_args["user_coupon_id"],
+            ):
+                action = bind_action(work, tool_name, args, service=service if postgres else None)
+                if action.action_id != action_id:
+                    raise _fail("动作标识与授权不匹配")
+                before = service.action_snapshot(getattr(args, "order_id", None), **snapshot_args)
+                kwargs = {name: getattr(args, name) for name in type(args).model_fields}
+                result = getattr(service, tool_name)(**kwargs)
             after = service.action_snapshot(result.order_id, **snapshot_args)
             consume_action(draft, action, success=True)
             if ctx.tool_call_id is not None:
@@ -162,28 +185,41 @@ def execute_action(
                 )
                 draft.messages.append(tool_result_message(ctx.tool_call_id, reply))
             store.save(draft)
-            ctx.db.execute(
-                "INSERT INTO action_executions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    hashlib.sha256(canonical_json(key).encode()).hexdigest(),
-                    *key,
-                    version,
-                    tool_name,
-                    canonical_json(canonical),
-                    digest,
-                    result.model_dump_json(),
-                    before.model_dump_json(),
-                    after.model_dump_json(),
-                    ctx.clock.now().isoformat(),
+            persist_execution(
+                store,
+                ActionExecution(
+                    execution_key=execution_key,
+                    session_id=session.session_id,
+                    proposal_id=proposal_id,
+                    action_id=action_id,
+                    version=version,
+                    tool_name=tool_name,
+                    canonical_args=canonical,
+                    args_hash=digest,
+                    result=result,
+                    before_snapshot=before,
+                    after_snapshot=after,
+                    created_at=ctx.clock.now().isoformat(),
                 ),
             )
-    _sync(session, draft)
+            if is_postgres(ctx.db):
+                from aftersales.core.outbox import enqueue
+
+                enqueue(
+                    ctx.db,
+                    ctx.clock,
+                    execution_key,
+                    tool_name,
+                    result,
+                    address=kwargs.get("address"),
+                )
+    session.restore_checkpoint(draft)
     ctx.result_checkpointed = ctx.tool_call_id is not None
     return result
 
 
 def execute_proposal(
-    ctx: ToolContext, proposal_id: str, version: int, *, trace: TraceWriter | None = None
+    ctx: ToolContext, proposal_id: str, version: int, *, trace: TraceSink | None = None
 ) -> list[OperationResult]:
     """Execute/recover an approved plan; P08 candidates remain pending manual approval."""
     proposal = next((p for p in ctx.session.proposals if p.proposal_id == proposal_id), None)

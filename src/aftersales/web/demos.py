@@ -1,5 +1,7 @@
 """Offline scripts use the production loop, authorization and execution checkpoints."""
 
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from typing import Any
 
 from pydantic import BaseModel
@@ -8,9 +10,10 @@ from aftersales.core.config import AgentConfig
 from aftersales.core.execution import execute_action, execute_proposal
 from aftersales.core.llm import LLMResponse, Message, MockLLM, ToolCall
 from aftersales.core.loop import Session
-from aftersales.core.runtime import build_agent
+from aftersales.core.runtime import build_async_agent
 from aftersales.core.session_store import SessionStore
 from aftersales.core.tracing import TraceWriter
+from aftersales.domain.clock import Clock
 from aftersales.domain.services import PolicyError, Services
 from aftersales.policy.proposal import decide_proposal
 from aftersales.tools.registry import ToolContext
@@ -35,9 +38,12 @@ LABELS = {
 }
 
 
-def progress(store: SessionStore, session_id: str) -> DemoProgress | None:
+def initialize_demos(store: SessionStore) -> None:
     store.db.execute("""CREATE TABLE IF NOT EXISTS demo_progress (
         session_id TEXT PRIMARY KEY, scenario INTEGER NOT NULL, step INTEGER NOT NULL)""")
+
+
+def progress(store: SessionStore, session_id: str) -> DemoProgress | None:
     row = store.db.execute(
         "SELECT scenario, step FROM demo_progress WHERE session_id=?", (session_id,)
     ).fetchone()
@@ -60,7 +66,7 @@ def using(tool_name: str, **arguments: Any) -> LLMResponse:
     )
 
 
-def revise(store: SessionStore, session: Session, trace: TraceWriter, text: str) -> bool:
+def revision_script(store: SessionStore, session: Session, text: str) -> list[LLMResponse] | None:
     """Recognize only the explicit offline amendment; arbitrary input is handled by the client."""
     state = progress(store, session.session_id)
     if (
@@ -69,10 +75,10 @@ def revise(store: SessionStore, session: Session, trace: TraceWriter, text: str)
         or state.step not in {1, 2}
         or text.strip().rstrip("。") != "只改地址，先不退差"
     ):
-        return False
+        return None
     address = Services(store.db, store.clock).get_order("O1006").address.model_dump()
     address["detail"] = "公司88号"
-    script = [
+    return [
         using(
             "propose_actions",
             actions=[
@@ -84,20 +90,26 @@ def revise(store: SessionStore, session: Session, trace: TraceWriter, text: str)
         ),
         LLMResponse(text="旧方案已撤销。P0002 v2仅改送公司88号，不退差，请重新确认。"),
     ]
-    options = AgentConfig(proposal_gate=True)
-    build_agent(store.db, store.clock, MockLLM(script), options, trace).respond(session, text)
+
+
+def finish_revision(store: SessionStore, session: Session) -> None:
     store.db.execute("UPDATE demo_progress SET step=3 WHERE session_id=?", (session.session_id,))
-    return True
 
 
-def advance(store: SessionStore, session: Session, trace: TraceWriter) -> None:
-    state = progress(store, session.session_id)
-    if state is None or state.step >= state.total:
-        return
+async def advance(
+    access: Callable[[], AbstractContextManager[SessionStore]],
+    session: Session,
+    trace: TraceWriter,
+    clock: Clock,
+) -> None:
     options = AgentConfig(proposal_gate=True)
-    ctx = ToolContext(session, options, store.db, store.clock)
-    service = Services(store.db, store.clock)
-    address = service.get_order("O1006").address.model_dump()
+    with access() as store:
+        state = progress(store, session.session_id)
+        if state is None or state.step >= state.total:
+            return
+        service = Services(store.db, store.clock)
+        address = service.get_order("O1006").address.model_dump()
+        profile = service.get_user("U005" if state.scenario == 3 else "U006")
     address["detail"] = "公司88号"
     edit = {"tool_name": "modify_address", "arguments": {"order_id": "O1006", "address": address}}
     price = {
@@ -110,13 +122,15 @@ def advance(store: SessionStore, session: Session, trace: TraceWriter) -> None:
         "reason": "无理由退货",
     }
 
-    def turn(text: str, script: list[LLMResponse]) -> None:
-        build_agent(store.db, store.clock, MockLLM(script), options, trace).respond(session, text)
+    async def turn(text: str, script: list[LLMResponse]) -> None:
+        agent = build_async_agent(access, clock, MockLLM(script), options, trace)
+        await agent.respond(session, text)
 
-    def approve(execute: bool = True) -> None:
+    def approve(store: SessionStore) -> None:
         proposal = session.proposals[-1]
         if proposal.status == "pending":
             decide_proposal(session, proposal.proposal_id, proposal.version, "approve")
+            store.save(session)
         trace.emit(
             "confirm_verdict",
             proposal_id=proposal.proposal_id,
@@ -125,12 +139,10 @@ def advance(store: SessionStore, session: Session, trace: TraceWriter) -> None:
             allowed=True,
             rule_ids=[],
         )
-        if execute:
-            execute_proposal(ctx, proposal.proposal_id, proposal.version, trace=trace)
+        ctx = ToolContext(session, options, store.db, store.clock)
+        execute_proposal(ctx, proposal.proposal_id, proposal.version, trace=trace)
 
     if state.step == 0:
-        user = "U005" if state.scenario == 3 else "U006"
-        profile = service.get_user(user)
         script = [using("find_user_by_phone", phone=profile.phone, name=profile.name)]
         if state.scenario == 3:
             script += [
@@ -150,17 +162,20 @@ def advance(store: SessionStore, session: Session, trace: TraceWriter) -> None:
                     + "原路退差¥57.00，请确认整份方案。"
                 ),
             ]
-        turn(f"我是{profile.name}，电话{profile.phone}。请办理演示所示方案，先复述再确认。", script)
+        await turn(
+            f"我是{profile.name}，电话{profile.phone}。请办理演示所示方案，先复述再确认。", script
+        )
     elif state.scenario == 1:
         if state.step == 1:
             if session.proposals[-1].status == "consumed":
                 # A direct card decision chose the original complete plan instead of the script.
-                store.db.execute(
-                    "UPDATE demo_progress SET step=4 WHERE session_id=?", (session.session_id,)
-                )
+                with access() as store:
+                    store.db.execute(
+                        "UPDATE demo_progress SET step=4 WHERE session_id=?", (session.session_id,)
+                    )
                 return
             tampered = {**address, "detail": "被篡改的地址"}
-            turn(
+            await turn(
                 "确认",
                 [
                     using("modify_address", order_id="O1006", address=tampered),
@@ -169,60 +184,72 @@ def advance(store: SessionStore, session: Session, trace: TraceWriter) -> None:
                 ],
             )
         elif state.step == 2:
-            revise(store, session, trace, "只改地址，先不退差")
+            amendment = "只改地址，先不退差"
+            with access() as store:
+                script = revision_script(store, session, amendment)
+            assert script is not None
+            await turn(amendment, script)
+            with access() as store:
+                finish_revision(store, session)
             return
         else:
-            approve()
+            with access() as store:
+                approve(store)
+            session._store = None
     elif state.scenario == 2:
-        if state.step == 1:
-            approve()
-            # Deliberately discard the in-memory response after the real transaction commits.
-            restored = store.load(session.session_id)
-            session.__dict__.update(restored.__dict__)
-            session._revision = restored._revision
-            trace.emit(
-                "recovery", status="response_discarded_after_commit", session_id=session.session_id
-            )
-        else:
-            proposal = session.proposals[-1]
-            action = proposal.actions[0]
-            result = execute_action(
-                ctx,
-                proposal.proposal_id,
-                action.action_id,
-                proposal.version,
-                action.tool_name,
-                action.canonical_args,
-            )
-            trace.emit(
-                "recovery",
-                status="replayed",
-                result=result.model_dump(mode="json"),
-                refunds_count=store.db.execute(
-                    "SELECT count(*) FROM refunds WHERE order_id='O1006'"
-                ).fetchone()[0],
-            )
-            try:
-                execute_action(
+        with access() as store:
+            if state.step == 1:
+                approve(store)
+                # Deliberately discard the in-memory response after the real transaction commits.
+                restored = store.load(session.session_id, attach=False)
+                session.restore_checkpoint(restored)
+                trace.emit(
+                    "recovery",
+                    status="response_discarded_after_commit",
+                    session_id=session.session_id,
+                )
+            else:
+                ctx = ToolContext(session, options, store.db, store.clock)
+                proposal = session.proposals[-1]
+                action = proposal.actions[0]
+                result = execute_action(
                     ctx,
                     proposal.proposal_id,
                     action.action_id,
                     proposal.version,
                     action.tool_name,
-                    {"order_id": "O1006", "order_item_id": "OI00007"},
+                    action.canonical_args,
                 )
-            except PolicyError as exc:
                 trace.emit(
-                    "confirm_verdict",
-                    allowed=False,
-                    rule_ids=exc.rule_ids,
-                    reason=str(exc),
-                    source="idempotency",
-                    proposal_id=proposal.proposal_id,
-                    action_id=action.action_id,
+                    "recovery",
+                    status="replayed",
+                    result=result.model_dump(mode="json"),
+                    refunds_count=store.db.execute(
+                        "SELECT count(*) FROM refunds WHERE order_id='O1006'"
+                    ).fetchone()[0],
                 )
+                try:
+                    execute_action(
+                        ctx,
+                        proposal.proposal_id,
+                        action.action_id,
+                        proposal.version,
+                        action.tool_name,
+                        {"order_id": "O1006", "order_item_id": "OI00007"},
+                    )
+                except PolicyError as exc:
+                    trace.emit(
+                        "confirm_verdict",
+                        allowed=False,
+                        rule_ids=exc.rule_ids,
+                        reason=str(exc),
+                        source="idempotency",
+                        proposal_id=proposal.proposal_id,
+                        action_id=action.action_id,
+                    )
+        session._store = None
     else:
-        turn(
+        await turn(
             "确认",
             [
                 using("request_return", **refund),
@@ -239,7 +266,9 @@ def advance(store: SessionStore, session: Session, trace: TraceWriter) -> None:
     session.messages.append(
         Message(role="assistant", content=f"[离线演示] {LABELS[state.scenario][state.step]}")
     )
-    session.persist()
-    store.db.execute(
-        "UPDATE demo_progress SET step=step+1 WHERE session_id=?", (session.session_id,)
-    )
+    with access() as store:
+        store.save(session)
+        store.db.execute(
+            "UPDATE demo_progress SET step=step+1 WHERE session_id=?", (session.session_id,)
+        )
+    session._store = None

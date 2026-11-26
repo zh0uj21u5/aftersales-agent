@@ -7,14 +7,19 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from aftersales.domain.models import ApprovalRequest, CheckResult, Violation
-from aftersales.domain.services import PolicyError
+from aftersales.domain.models import Action, ApprovalRequest, CheckResult, Violation
+from aftersales.domain.services import PolicyError, Services
 from aftersales.policy.proposal_text import (
     changes_plan,
     format_proposal_summary,  # noqa: F401 - public proposal renderer
     presentation_matches,
     whole_plan_acknowledgment,
 )
+from aftersales.tools.registry import ToolRegistry
+from aftersales.tools.write import WRITE_TOOLS
+
+_WRITE_REGISTRY = ToolRegistry(WRITE_TOOLS).freeze()
+
 
 if TYPE_CHECKING:
     from aftersales.tools.registry import SessionState, ToolContext
@@ -107,10 +112,7 @@ def latest_proposal(session: SessionState) -> ActionProposal | None:
 
 def validate_arguments(name: WriteToolName, arguments: dict[str, Any]) -> BaseModel:
     """Use the very same strict schemas as the executable write tools."""
-    from aftersales.tools.registry import ToolRegistry
-    from aftersales.tools.write import WRITE_TOOLS
-
-    entry = ToolRegistry(WRITE_TOOLS).get(name)
+    entry = _WRITE_REGISTRY.get(name)
     if entry is None:
         raise _fail("不支持的提案动作", "DATA")
     try:
@@ -123,9 +125,22 @@ def validate_arguments(name: WriteToolName, arguments: dict[str, Any]) -> BaseMo
     return args
 
 
-def preconditions(ctx: ToolContext, name: WriteToolName, args: BaseModel) -> dict[str, Any]:
+def validate_approval_arguments(
+    action: Action, arguments: dict[str, Any], order_id: str, reason: str
+) -> BaseModel:
+    if arguments.get("order_id", order_id) != order_id:
+        raise _fail("审批参数与订单不一致", "DATA")
+    canonical = {**arguments, "order_id": order_id}
+    if action != "apply_price_protection":
+        canonical.setdefault("reason", reason)
+    return validate_arguments(action, canonical)
+
+
+def preconditions(
+    ctx: ToolContext, name: WriteToolName, args: BaseModel, *, service: Services | None = None
+) -> dict[str, Any]:
     """Capture only action-relevant inputs; an address edit must not invalidate price protection."""
-    service = ctx.services()
+    service = service if service is not None else ctx.services()
     state: dict[str, Any] = {}
     if name == "create_order":
         user = service.get_user(args.user_id)
@@ -280,7 +295,7 @@ def create_proposal(ctx: ToolContext, actions: list[ActionRequest]) -> ProposalR
         if old.status != "consumed":
             invalidate(old, "superseded")
     session.proposals.append(proposal)
-    session.presented_proposal_version = None
+    session.confirmation.presented_version = None
     guidance = [
         "请在本轮直接复述整份方案的完整参数与精确金额并请求确认；部分同意或修改须重新提案并再次确认。"
     ]
@@ -365,7 +380,7 @@ def retire_submitted_approval(
     else:
         for action in matched:
             action.status = "invalidated"
-    session.presented_proposal_version = None
+    session.confirmation.presented_version = None
 
 
 def authorize_natural_language(session: SessionState, agrees: Callable[[], bool]) -> None:
@@ -373,7 +388,7 @@ def authorize_natural_language(session: SessionState, agrees: Callable[[], bool]
     proposal = latest_proposal(session)
     if proposal is None or proposal.status not in {"pending", "approved"}:
         return
-    index = session.confirmation_user_index
+    index = session.confirmation.user_index
     if index < 0:
         return
     text = session.messages[index].content or ""
@@ -383,9 +398,9 @@ def authorize_natural_language(session: SessionState, agrees: Callable[[], bool]
         invalidate(proposal, "rejected")
     elif (
         proposal.status == "pending"
-        and session.confirmation_proposal
-        and session.presented_proposal_version == proposal.version
-        and presentation_matches(session.confirmation_proposal, proposal)
+        and session.confirmation.presented_text
+        and session.confirmation.presented_version == proposal.version
+        and presentation_matches(session.confirmation.presented_text, proposal)
         and whole_plan_acknowledgment(text, proposal, step=step)
         and agrees()
     ):
@@ -394,7 +409,9 @@ def authorize_natural_language(session: SessionState, agrees: Callable[[], bool]
         )
 
 
-def bind_action(ctx: ToolContext, name: str, args: BaseModel) -> ProposedAction:
+def bind_action(
+    ctx: ToolContext, name: str, args: BaseModel, *, service: Services | None = None
+) -> ProposedAction:
     from aftersales.core.hooks import Deny
     from aftersales.core.llm import ToolCall
     from aftersales.policy.guard import business_check, check_access
@@ -423,13 +440,15 @@ def bind_action(ctx: ToolContext, name: str, args: BaseModel) -> ProposedAction:
         raise _fail(
             f"调用参数或动作与已确认方案 {label} 不一致，或授权已消费；请重新 propose_actions 并征求确认"
         )
-    access = check_access(ctx, ToolCall(id="binding", name=name, arguments=canonical))
+    access = check_access(
+        ctx, ToolCall(id="binding", name=name, arguments=canonical), service=service
+    )
     if isinstance(access, Deny):
         invalidate(proposal, "expired")
         raise _fail(access.reason, "P01")
     try:
-        check = business_check(ctx, name, args)
-        snapshot = preconditions(ctx, action.tool_name, args)
+        check = business_check(ctx, name, args, service=service)
+        snapshot = preconditions(ctx, action.tool_name, args, service=service)
     except ValueError as exc:
         invalidate(proposal, "expired")
         raise _fail(f"方案 {label} 的业务前提已失效；请重新 propose_actions 并征求确认") from exc

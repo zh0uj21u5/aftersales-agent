@@ -1,0 +1,11 @@
+*
+!pyproject.toml
+!README.md
+!src/
+!src/**
+!evals/
+!evals/**
+!migrations/
+!migrations/Dockerfile
+**/__pycache__/
+evals/reports/

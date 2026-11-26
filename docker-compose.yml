@@ -1,0 +1,42 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: aftersales
+      POSTGRES_USER: aftersales
+      POSTGRES_PASSWORD: aftersales_dev
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "aftersales", "-d", "aftersales"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+  migrate:
+    build:
+      context: .
+      dockerfile: migrations/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://aftersales:aftersales_dev@postgres:5432/aftersales
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["python", "-m", "aftersales.domain.migrate", "--seed"]
+
+volumes:
+  pg_data:
+  redis_data:

@@ -194,7 +194,7 @@ def _money_value(match: re.Match[str]) -> Decimal:
 
 
 def changes_plan(text: str, proposal: ActionProposal, *, step: int | None = None) -> bool:
-    from aftersales.core.hooks import has_veto
+    from aftersales.policy.confirmation import has_veto
 
     if has_veto(text):
         return True

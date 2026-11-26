@@ -3,7 +3,7 @@
 from pydantic import ValidationError
 
 from aftersales.core.config import AgentConfig
-from aftersales.core.hooks import Allow, Deny, Hooks, PolicyHooks
+from aftersales.core.hooks import Allow, ContextScope, Deny, Hooks, PolicyHooks
 from aftersales.core.llm import LLMResponse, ToolCall
 from aftersales.core.loop import Session, TurnResult
 from aftersales.core.tracing import TraceWriter
@@ -30,6 +30,14 @@ class AuditHooks(Hooks):
 
     def on_user_message(self, ctx: ToolContext) -> None:
         self.inner.on_user_message(ctx)
+
+    async def on_user_message_async(
+        self, session: Session, config: AgentConfig, scope: ContextScope
+    ) -> None:
+        await self.inner.on_user_message_async(session, config, scope)
+
+    async def prepare_tool(self, scope: ContextScope, call: ToolCall, config: AgentConfig) -> None:
+        await self.inner.prepare_tool(scope, call, config)
 
     def before_llm(self, session: Session) -> None:
         self.shadow.messages = session.messages[:]

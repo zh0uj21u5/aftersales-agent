@@ -151,3 +151,10 @@ CREATE TABLE handoffs (
     reason TEXT NOT NULL,
     created_at TEXT NOT NULL
 ) STRICT;
+
+-- Read indexes
+CREATE INDEX IF NOT EXISTS idx_orders_user_created ON orders(user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items(order_id);
+CREATE INDEX IF NOT EXISTS idx_aftersales_order ON aftersales(order_id);
+CREATE INDEX IF NOT EXISTS idx_refunds_order ON refunds(order_id);
+CREATE INDEX IF NOT EXISTS idx_approvals_user_status ON approvals(user_id, status);

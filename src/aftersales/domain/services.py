@@ -1,14 +1,24 @@
 """Integer money arithmetic and shared, side-effect-free policy checks."""
 
 import json
-import sqlite3
+from collections import defaultdict
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import TypeVar
 
 from pydantic import BaseModel, JsonValue
 
 from aftersales.domain.clock import Clock
-from aftersales.domain.db import insert, next_id, transaction
+from aftersales.domain.db import (
+    DbConnection,
+    insert,
+    insert_generated_id,
+    is_postgres,
+    next_id,
+    sequence_id_sql,
+    transaction,
+)
 from aftersales.domain.models import (
     SKU,
     Address,
@@ -227,13 +237,17 @@ def exchange_amount(item: OrderItem, new_price_cents: int) -> tuple[int, bool]:
     return proportional_difference(item, new_price_cents, quantity), False
 
 
-def check_exchange(order: Order, line: Line, new_sku: SKU, now: datetime) -> CheckResult:
+def check_exchange(
+    order: Order, line: Line, new_sku: SKU, now: datetime, *, require_normal: bool = False
+) -> CheckResult:
     violations = _return_window(order, line, now)
     quantity = line.item.qty - line.item.returned_qty
     if quantity <= 0:
         violations.append(_issue("P09", "该商品行已全部退货"))
     elif line.item.status == "exchanged":
         violations.append(_issue("P09", "同一商品行不重复换货，请转人工"))
+    elif require_normal and line.item.status != "normal":
+        violations.append(_issue("P09", "仅正常商品行可以换货，请转人工"))
     if new_sku.id == line.item.sku_id or new_sku.spu_id != line.sku.spu_id:
         violations.append(_issue("P09", "只能换成同一 SPU 的其他 SKU"))
     if new_sku.stock < quantity:
@@ -292,13 +306,22 @@ class Services:
     """Own database effects; public checks above consume immutable snapshots."""
 
     def __init__(
-        self, db: sqlite3.Connection, clock: Clock, *, enforce_policy: bool = True
+        self,
+        db: DbConnection,
+        clock: Clock,
+        *,
+        enforce_policy: bool = True,
+        execution_key: str | None = None,
+        approved_refund_cents: int | None = None,
     ) -> None:
         self.db = db
         self.clock = clock
         self.enforce_policy = enforce_policy
+        self.execution_key = execution_key
+        self.approved_refund_cents = approved_refund_cents
+        self._locked_order: Order | None = None
 
-    def _row(self, table: str, record_id: str, model: type[Model]) -> Model:
+    def _row(self, table: str, record_id: str, model: type[Model], *, lock: bool = False) -> Model:
         tables = {
             "orders",
             "order_items",
@@ -310,7 +333,8 @@ class Services:
         }
         if table not in tables:
             raise ValueError("Unknown snapshot table")
-        row = self.db.execute(f"SELECT * FROM {table} WHERE id=?", (record_id,)).fetchone()
+        suffix = " FOR UPDATE" if lock else ""
+        row = self.db.execute(f"SELECT * FROM {table} WHERE id=?{suffix}", (record_id,)).fetchone()
         if row is None:
             raise ValueError(f"不存在的资源：{table}/{record_id}")
         values = dict(row)
@@ -351,7 +375,7 @@ class Services:
         return [
             self.get_order(row[0])
             for row in self.db.execute(
-                "SELECT id FROM orders WHERE user_id=? AND (? IS NULL OR status=?) ORDER BY id",
+                "SELECT id FROM orders WHERE user_id=? AND (CAST(? AS TEXT) IS NULL OR status=?) ORDER BY id",
                 (user_id, status, status),
             )
         ]
@@ -378,37 +402,106 @@ class Services:
         user_coupon_id: str | None = None,
     ) -> BusinessSnapshot:
         """Read affected rows inside the caller's execution transaction."""
+        return self._action_snapshots([order_id], sku_ids or [], user_coupon_id)[0]
 
-        def rows(table: str, column: str, ids: list[str]) -> list[dict[str, JsonValue]]:
-            if not ids:
-                return []
-            placeholders = ",".join("?" for _ in ids)
-            result = []
-            for row in self.db.execute(
-                f"SELECT * FROM {table} WHERE {column} IN ({placeholders}) ORDER BY {column}, rowid",
-                ids,
-            ):
-                value = dict(row)
-                for field in ("address", "attrs"):
-                    if field in value:
-                        value[field] = json.loads(value[field])
-                result.append(value)
+    def batch_action_snapshots(self, order_ids: Sequence[str]) -> list[BusinessSnapshot]:
+        """Read a set of orders in batches and return snapshots in input order."""
+        return self._action_snapshots(order_ids, [], None)
+
+    def _action_snapshots(
+        self, order_ids: Sequence[str | None], extra_skus: list[str], extra_coupon: str | None
+    ) -> list[BusinessSnapshot]:
+        if not order_ids:
+            return []
+        if is_postgres(self.db):
+            rows = self.db.execute(
+                """SELECT jsonb_build_object(
+                    'orders', CASE WHEN o.id IS NULL THEN '[]'::jsonb ELSE jsonb_build_array(o) END,
+                    'order_items', line.rows,
+                    'skus', (SELECT coalesce(jsonb_agg(s ORDER BY s.id), '[]') FROM skus s
+                        WHERE s.id=ANY(?::text[]) OR s.id=ANY(line.sku_ids)),
+                    'user_coupons', (SELECT coalesce(jsonb_agg(c ORDER BY c.id), '[]')
+                        FROM user_coupons c WHERE c.id=? OR c.id=o.user_coupon_id),
+                    'aftersales', (SELECT coalesce(jsonb_agg(a ORDER BY a.id), '[]')
+                        FROM aftersales a WHERE a.order_id=o.id),
+                    'refunds', (SELECT coalesce(jsonb_agg(r ORDER BY r.id), '[]')
+                        FROM refunds r WHERE r.order_id=o.id),
+                    'shipments', (SELECT coalesce(jsonb_agg(s), '[]')
+                        FROM shipments s WHERE s.order_id=o.id)
+                   )
+                   FROM unnest(?::text[]) WITH ORDINALITY AS requested(order_id, position)
+                   LEFT JOIN orders o ON o.id=requested.order_id
+                   CROSS JOIN LATERAL (
+                       SELECT coalesce(jsonb_agg(i ORDER BY i.id), '[]') AS rows,
+                              array_agg(i.sku_id) AS sku_ids
+                       FROM order_items i WHERE i.order_id=o.id
+                   ) line
+                   ORDER BY requested.position""",
+                (extra_skus, extra_coupon, list(order_ids)),
+            )
+            return [BusinessSnapshot.model_validate_json(row[0]) for row in rows]
+
+        def grouped(
+            table: str, column: str, ids: Sequence[str]
+        ) -> dict[str, list[dict[str, JsonValue]]]:
+            result = defaultdict(list)
+            for start in range(0, len(ids), 500):
+                batch = ids[start : start + 500]
+                placeholders = ",".join("?" for _ in batch)
+                for row in self.db.execute(
+                    f"SELECT * FROM {table} WHERE {column} IN ({placeholders}) "
+                    f"ORDER BY {column}, rowid",
+                    batch,
+                ):
+                    value = dict(row)
+                    for field in ("address", "attrs"):
+                        if field in value:
+                            value[field] = json.loads(value[field])
+                    result[row[column]].append(value)
             return result
 
-        orders = rows("orders", "id", [order_id] if order_id else [])
-        items = rows("order_items", "order_id", [order_id] if order_id else [])
-        skus = sorted(set(sku_ids or []) | {str(item["sku_id"]) for item in items})
-        coupons = {user_coupon_id} if user_coupon_id else set()
-        coupons |= {str(order["user_coupon_id"]) for order in orders if order["user_coupon_id"]}
-        return BusinessSnapshot(
-            orders=orders,
-            order_items=items,
-            skus=rows("skus", "id", skus),
-            user_coupons=rows("user_coupons", "id", sorted(coupons)),
-            aftersales=rows("aftersales", "order_id", [order_id] if order_id else []),
-            refunds=rows("refunds", "order_id", [order_id] if order_id else []),
-            shipments=rows("shipments", "order_id", [order_id] if order_id else []),
+        ids = list(dict.fromkeys(i for i in order_ids if i is not None))
+        orders = grouped("orders", "id", ids)
+        items = grouped("order_items", "order_id", ids)
+        sku_ids = set(extra_skus) | {
+            str(item["sku_id"]) for group in items.values() for item in group
+        }
+        coupon_ids = {extra_coupon} if extra_coupon else set()
+        coupon_ids.update(
+            str(o["user_coupon_id"])
+            for group in orders.values()
+            for o in group
+            if o["user_coupon_id"]
         )
+        skus = grouped("skus", "id", sorted(sku_ids))
+        coupons = grouped("user_coupons", "id", sorted(coupon_ids))
+        aftersales = grouped("aftersales", "order_id", ids)
+        refunds = grouped("refunds", "order_id", ids)
+        shipments = grouped("shipments", "order_id", ids)
+
+        snapshots = []
+        for order_id in order_ids:
+            order_rows = orders.get(order_id, [])
+            order_items = items.get(order_id, [])
+            order_skus = sorted(set(extra_skus) | {str(item["sku_id"]) for item in order_items})
+            order_coupons = {extra_coupon} if extra_coupon else set()
+            order_coupons.update(
+                str(o["user_coupon_id"]) for o in order_rows if o["user_coupon_id"]
+            )
+            snapshots.append(
+                BusinessSnapshot(
+                    orders=order_rows,
+                    order_items=order_items,
+                    skus=[row for sku in order_skus for row in skus.get(sku, [])],
+                    user_coupons=[
+                        row for coupon in sorted(order_coupons) for row in coupons.get(coupon, [])
+                    ],
+                    aftersales=aftersales.get(order_id, []),
+                    refunds=refunds.get(order_id, []),
+                    shipments=shipments.get(order_id, []),
+                )
+            )
+        return snapshots
 
     def get_product(self, spu_id: str | None = None, sku_id: str | None = None) -> Product:
         if (spu_id is None) == (sku_id is None):
@@ -437,7 +530,8 @@ class Services:
         owned = [
             UserCoupon.model_validate(dict(row))
             for row in self.db.execute(
-                "SELECT * FROM user_coupons WHERE user_id=? AND (? IS NULL OR status=?) ORDER BY id",
+                """SELECT * FROM user_coupons WHERE user_id=?
+                   AND (CAST(? AS TEXT) IS NULL OR status=?) ORDER BY id""",
                 (user_id, status, status),
             )
         ]
@@ -447,9 +541,11 @@ class Services:
         ]
 
     def refunded_cents(self, order_id: str) -> int:
-        return self.db.execute(
+        total = self.db.execute(
             "SELECT coalesce(sum(amount_cents),0) FROM refunds WHERE order_id=?", (order_id,)
         ).fetchone()[0]
+        # PostgreSQL promotes SUM(bigint) to numeric. The inputs are integer cents.
+        return int(total)
 
     def check_purchase(
         self,
@@ -493,7 +589,13 @@ class Services:
                 result = check_return(order, [(line, quantity)], self.clock.now())
             elif action == "request_exchange" and new_sku_id is not None:
                 target = self.get_sku(new_sku_id)
-                result = check_exchange(order, line, target, self.clock.now())
+                result = check_exchange(
+                    order,
+                    line,
+                    target,
+                    self.clock.now(),
+                    require_normal=is_postgres(self.db),
+                )
                 if target.price_cents > line.item.unit_price_cents:
                     direction = "top_up"
             else:
@@ -505,6 +607,8 @@ class Services:
         )
 
     def get_order(self, order_id: str) -> Order:
+        if self._locked_order is not None and self._locked_order.id == order_id:
+            return self._locked_order
         return self._row("orders", order_id, Order)
 
     def get_sku(self, sku_id: str) -> SKU:
@@ -520,6 +624,16 @@ class Services:
         return SKU.model_validate(values)
 
     def get_line(self, order_id: str, order_item_id: str) -> Line:
+        if is_postgres(self.db):
+            row = self.db.execute(
+                """SELECT to_jsonb(i), to_jsonb(s) || jsonb_build_object('category', p.category)
+                   AS sku FROM order_items i JOIN skus s ON s.id=i.sku_id
+                   JOIN spus p ON p.id=s.spu_id WHERE i.id=? AND i.order_id=?""",
+                (order_item_id, order_id),
+            ).fetchone()
+            if row is None:
+                raise ValueError("商品行不存在或不属于该订单")
+            return Line(OrderItem.model_validate_json(row[0]), SKU.model_validate_json(row[1]))
         item = self._row("order_items", order_item_id, OrderItem)
         if item.order_id != order_id:
             raise ValueError("商品行不属于该订单")
@@ -530,11 +644,21 @@ class Services:
             raise PolicyError(
                 CheckResult(violations=[_issue("P15", "退款只能退回该订单原支付账户")])
             )
+        if is_postgres(self.db):
+            # The immediate (payment_method_id, user_id) foreign key proves ownership.
+            return order.payment_method_id
         payment = self._row("payment_methods", order.payment_method_id, PaymentMethod)
         result = check_refund_destination(order, payment)
         if not result.allowed:
             raise PolicyError(result)
         return payment.id
+
+    def _insert_record(self, table: str, **values: str | int | None) -> str:
+        if is_postgres(self.db):
+            return insert_generated_id(self.db, table, **values)
+        record_id = next_id(self.db, table)
+        insert(self.db, table, id=record_id, **values)
+        return record_id
 
     def _aftersale(
         self,
@@ -548,50 +672,46 @@ class Services:
         new_sku_id: str | None = None,
         awaiting_payment: bool = False,
     ) -> str:
-        record_id = next_id(self.db, "aftersales")
-        insert(
-            self.db,
+        return self._insert_record(
             "aftersales",
-            id=record_id,
             order_id=order.id,
             order_item_id=item.id,
             type=kind,
-            status="awaiting_payment" if awaiting_payment else "completed",
+            status=("awaiting_payment" if awaiting_payment else self._refund_outcome(amount)),
             qty=qty,
             amount_cents=amount,
             new_sku_id=new_sku_id,
             reason=reason,
             created_at=self.clock.now().isoformat(),
         )
-        return record_id
 
     def _refund(
         self,
         order: Order,
         amount: int,
         aftersale_id: str | None,
-        payment_method_id: str | None = None,
+        destination: str,
     ) -> str:
-        destination = self._destination(order, payment_method_id)
         _integer(amount)
-        refunded = self.db.execute(
-            "SELECT coalesce(sum(amount_cents),0) FROM refunds WHERE order_id=?", (order.id,)
-        ).fetchone()[0]
+        refunded = self.refunded_cents(order.id)
         if amount + refunded > order.paid_cents:
             raise ValueError("累计退款不能超过订单实付")
-        record_id = next_id(self.db, "refunds")
-        insert(
-            self.db,
+        stamp = self.clock.now().isoformat()
+        production = (
+            {"execution_key": self.execution_key, "status_changed_at": stamp}
+            if self.execution_key is not None
+            else {}
+        )
+        return self._insert_record(
             "refunds",
-            id=record_id,
             order_id=order.id,
             aftersale_id=aftersale_id,
             amount_cents=amount,
             payment_method_id=destination,
-            status="success",
-            created_at=self.clock.now().isoformat(),
+            status="pending" if self._refund_outcome(amount) == "processing" else "success",
+            created_at=stamp,
+            **production,
         )
-        return record_id
 
     def _enforce(self, result: CheckResult) -> None:
         violations = (
@@ -603,18 +723,110 @@ class Services:
                 if issue.rule_id in {"DATA", "STOCK", "P06", "P15"}
             ]
         )
+        if self.approved_refund_cents is not None:
+            if not result.needs_approval or self.approved_refund_cents != result.amount_cents:
+                raise PolicyError(
+                    CheckResult(violations=[_issue("P08", "退款金额已变化，请重新申请审批")])
+                )
+            violations = [issue for issue in violations if issue.rule_id != "P08"]
         if violations:
             raise PolicyError(result.model_copy(update={"violations": violations}))
+
+    def _refund_outcome(self, amount: int) -> str:
+        return "processing" if self.execution_key is not None and amount > 0 else "completed"
+
+    def _order_for_write(self, order_id: str) -> Order:
+        if not is_postgres(self.db):
+            return self.get_order(order_id)
+        if self._locked_order is not None and self._locked_order.id == order_id:
+            order, self._locked_order = self._locked_order, None
+            return order
+        order = self._row("orders", order_id, Order, lock=True)
+        if self.execution_key is not None:
+            issue = self.db.execute(
+                """SELECT 1 FROM reconciliation_discrepancies
+               WHERE order_id=? AND resolved_at IS NULL LIMIT 1""",
+                (order_id,),
+            ).fetchone()
+            self._require_reconciled(issue is None)
+        return order
+
+    @staticmethod
+    def _require_reconciled(allowed: bool) -> None:
+        if not allowed:
+            raise PolicyError(CheckResult(violations=[_issue("P12", "订单资金待核对，请转人工")]))
+
+    def _lock_skus(self, sku_ids: Sequence[str]) -> None:
+        if sku_ids and is_postgres(self.db):
+            self.db.execute(
+                "SELECT id FROM skus WHERE id=ANY(?::text[]) ORDER BY id FOR UPDATE",
+                (sorted(set(sku_ids)),),
+            )
+
+    @contextmanager
+    def lock_action_resources(
+        self, order_id: str | None, sku_ids: Sequence[str], coupon_id: str | None
+    ) -> Iterator[None]:
+        """Freeze inputs and reuse the locked order for a single write in this transaction."""
+        if not is_postgres(self.db):
+            yield
+            return
+        if not self.db.in_transaction or self._locked_order is not None:
+            raise RuntimeError("Action resource locks require a caller-owned transaction")
+        order = None
+        if order_id is not None:
+            order = self._row("orders", order_id, Order, lock=True)
+            coupon_id = order.user_coupon_id
+            # Use a fresh READ COMMITTED snapshot after any wait for the order lock.
+            row = self.db.execute(
+                """WITH reconciliation AS (
+                       SELECT NOT EXISTS (
+                           SELECT 1 FROM reconciliation_discrepancies
+                           WHERE ?::boolean AND order_id=? AND resolved_at IS NULL
+                       ) AS allowed
+                   ), locked_skus AS (
+                       SELECT id FROM skus WHERE (SELECT allowed FROM reconciliation)
+                           AND (id=ANY(?::text[]) OR id IN (
+                               SELECT sku_id FROM order_items WHERE order_id=?
+                           ))
+                       ORDER BY id FOR UPDATE
+                   )
+                   SELECT allowed, (SELECT count(*) FROM locked_skus) FROM reconciliation""",
+                (self.execution_key is not None, order_id, list(sku_ids), order_id),
+            ).fetchone()
+            self._require_reconciled(row["allowed"])
+        else:
+            self._lock_skus(sku_ids)
+        if coupon_id is not None:
+            self.db.execute("SELECT id FROM user_coupons WHERE id=? FOR UPDATE", (coupon_id,))
+        self._locked_order = order
+        try:
+            yield
+        finally:
+            self._locked_order = None
+
+    def _take_stock(self, sku_id: str, qty: int) -> None:
+        affected = self.db.execute(
+            "UPDATE skus SET stock=stock-? WHERE id=? AND stock>=?", (qty, sku_id, qty)
+        ).rowcount
+        self._require_updated(affected, "STOCK", "购买或换货库存不足")
+
+    @staticmethod
+    def _require_updated(affected: int, rule_id: str, reason: str) -> None:
+        if affected != 1:
+            raise PolicyError(CheckResult(violations=[_issue(rule_id, reason)]))
 
     def modify_address(self, order_id: str, address: Address) -> OperationResult:
         address = Address.model_validate(address)
         with transaction(self.db):
-            order = self.get_order(order_id)
+            order = self._order_for_write(order_id)
             self._enforce(check_modify_address(order))
             self.db.execute(
                 "UPDATE orders SET address=? WHERE id=?", (address.model_dump_json(), order_id)
             )
-        return OperationResult(order_id=order_id, status="updated")
+        return OperationResult(
+            order_id=order_id, status="processing" if self.execution_key else "updated"
+        )
 
     def cancel_order(
         self,
@@ -624,39 +836,20 @@ class Services:
         refund_payment_method_id: str | None = None,
     ) -> OperationResult:
         with transaction(self.db):
-            order = self.get_order(order_id)
-            self._destination(order, refund_payment_method_id)
-            refunded = self.db.execute(
-                "SELECT coalesce(sum(amount_cents),0) FROM refunds WHERE order_id=?", (order_id,)
-            ).fetchone()[0]
+            order = self._order_for_write(order_id)
+            destination = self._destination(order, refund_payment_method_id)
+            refunded = self.refunded_cents(order_id)
             result = check_cancel_order(order, refunded)
             self._enforce(result)
             if order.status == "cancelled":
                 raise ValueError("订单已取消，不能重复回补库存")
             record_ids = (
-                [self._refund(order, result.amount_cents, None, refund_payment_method_id)]
+                [self._refund(order, result.amount_cents, None, destination)]
                 if order.paid_at
                 else []
             )
-            for row in self.db.execute(
-                "SELECT sku_id, qty FROM order_items WHERE order_id=?", (order_id,)
-            ).fetchall():
-                self.db.execute(
-                    "UPDATE skus SET stock=stock+? WHERE id=?", (row["qty"], row["sku_id"])
-                )
-            if order.user_coupon_id:
-                coupon = self.db.execute(
-                    """SELECT c.valid_to FROM user_coupons uc JOIN coupons c
-                    ON c.id=uc.coupon_id WHERE uc.id=?""",
-                    (order.user_coupon_id,),
-                ).fetchone()
-                status = (
-                    "unused" if self.clock.now() <= datetime.fromisoformat(coupon[0]) else "expired"
-                )
-                self.db.execute(
-                    "UPDATE user_coupons SET status=?, used_order_id=NULL WHERE id=?",
-                    (status, order.user_coupon_id),
-                )
+            if self.execution_key is None:
+                self.release_cancel_stock(order)
             self.db.execute("UPDATE orders SET status='cancelled' WHERE id=?", (order_id,))
             if order.paid_at is not None:
                 self.db.execute(
@@ -666,8 +859,53 @@ class Services:
         return OperationResult(
             order_id=order_id,
             amount_cents=result.amount_cents,
-            status="cancelled",
+            status="processing" if self.execution_key else "cancelled",
             record_ids=record_ids,
+        )
+
+    def release_cancel_stock(self, order: Order) -> None:
+        """Release stock and coupon under the caller's order lock after interception."""
+        order_id = order.id
+        items = self.db.execute(
+            "SELECT sku_id, qty FROM order_items WHERE order_id=?", (order_id,)
+        ).fetchall()
+        self._lock_skus([row["sku_id"] for row in items])
+        for row in items:
+            self.db.execute("UPDATE skus SET stock=stock+? WHERE id=?", (row["qty"], row["sku_id"]))
+        if order.user_coupon_id:
+            coupon = self.db.execute(
+                """SELECT c.valid_to FROM user_coupons uc JOIN coupons c
+                    ON c.id=uc.coupon_id WHERE uc.id=?""",
+                (order.user_coupon_id,),
+            ).fetchone()
+            status = (
+                "unused" if self.clock.now() <= datetime.fromisoformat(coupon[0]) else "expired"
+            )
+            if is_postgres(self.db):
+                self._require_updated(
+                    self.db.execute(
+                        """UPDATE user_coupons SET status=?, used_order_id=NULL
+                           WHERE id=? AND used_order_id=? AND status='used'""",
+                        (status, order.user_coupon_id, order_id),
+                    ).rowcount,
+                    "P13",
+                    "优惠券不属于当前取消订单",
+                )
+            else:
+                self.db.execute(
+                    "UPDATE user_coupons SET status=?, used_order_id=NULL WHERE id=?",
+                    (status, order.user_coupon_id),
+                )
+
+    def _reserve_line_refund(self, item_id: str, amount: int) -> None:
+        self._require_updated(
+            self.db.execute(
+                """UPDATE order_items SET refunded_cents=refunded_cents+?
+                   WHERE id=? AND refunded_cents+?<=paid_share_cents""",
+                (amount, item_id, amount),
+            ).rowcount,
+            "P06",
+            "商品行剩余退款额度不足",
         )
 
     def apply_price_protection(
@@ -678,26 +916,34 @@ class Services:
         refund_payment_method_id: str | None = None,
     ) -> OperationResult:
         with transaction(self.db):
-            order = self.get_order(order_id)
+            order = self._order_for_write(order_id)
             line = self.get_line(order_id, order_item_id)
-            self._destination(order, refund_payment_method_id)
+            if is_postgres(self.db):
+                self._lock_skus([line.item.sku_id])
+                line = self.get_line(order_id, order_item_id)
+            destination = self._destination(order, refund_payment_method_id)
             result = check_price_protection(order, line, self.clock.now())
             self._enforce(result)
+            if is_postgres(self.db):
+                self._require_updated(
+                    self.db.execute(
+                        "UPDATE orders SET price_protected=1 WHERE id=? AND price_protected=0",
+                        (order_id,),
+                    ).rowcount,
+                    "P04",
+                    "每单只能价保一次",
+                )
             record_id = self._aftersale(
                 order, line.item, "price_protection", line.item.qty, result.amount_cents, "降价价保"
             )
-            refund_id = self._refund(
-                order, result.amount_cents, record_id, refund_payment_method_id
-            )
-            self.db.execute("UPDATE orders SET price_protected=1 WHERE id=?", (order_id,))
-            self.db.execute(
-                "UPDATE order_items SET refunded_cents=refunded_cents+? WHERE id=?",
-                (result.amount_cents, order_item_id),
-            )
+            refund_id = self._refund(order, result.amount_cents, record_id, destination)
+            if not is_postgres(self.db):
+                self.db.execute("UPDATE orders SET price_protected=1 WHERE id=?", (order_id,))
+            self._reserve_line_refund(order_item_id, result.amount_cents)
         return OperationResult(
             order_id=order_id,
             amount_cents=result.amount_cents,
-            status="completed",
+            status=self._refund_outcome(result.amount_cents),
             record_ids=[record_id, refund_id],
         )
 
@@ -711,28 +957,113 @@ class Services:
     ) -> OperationResult:
         requests = [ReturnItem.model_validate(item) for item in items]
         with transaction(self.db):
-            order = self.get_order(order_id)
-            self._destination(order, refund_payment_method_id)
+            order = self._order_for_write(order_id)
+            destination = self._destination(order, refund_payment_method_id)
             lines = [(self.get_line(order_id, item.order_item_id), item.qty) for item in requests]
             result = check_return(order, lines, self.clock.now())
             self._enforce(result)
-            record_ids = []
-            for line, qty in lines:
-                amount = partial_refund(line.item, qty)
-                record_id = self._aftersale(order, line.item, "return", qty, amount, reason)
-                refund_id = self._refund(order, amount, record_id, refund_payment_method_id)
-                self.db.execute(
-                    """UPDATE order_items SET returned_qty=returned_qty+?,
-                    refunded_cents=refunded_cents+?, status='returned' WHERE id=?""",
-                    (qty, amount, line.item.id),
+            returns = [(line.item, qty, partial_refund(line.item, qty)) for line, qty in lines]
+            if is_postgres(self.db):
+                record_ids = self._record_postgres_return(
+                    order, returns, reason, destination, result.amount_cents
                 )
-                record_ids.extend([record_id, refund_id])
+            else:
+                record_ids = self._record_sqlite_return(order, returns, reason, destination)
         return OperationResult(
             order_id=order_id,
             amount_cents=result.amount_cents,
-            status="completed",
+            status=self._refund_outcome(result.amount_cents),
             record_ids=record_ids,
         )
+
+    def _record_sqlite_return(
+        self, order: Order, returns: list[tuple[OrderItem, int, int]], reason: str, destination: str
+    ) -> list[str]:
+        record_ids = []
+        for item, qty, amount in returns:
+            record_id = self._aftersale(order, item, "return", qty, amount, reason)
+            refund_id = self._refund(order, amount, record_id, destination)
+            self._require_updated(
+                self.db.execute(
+                    """UPDATE order_items SET returned_qty=returned_qty+?,
+                    refunded_cents=refunded_cents+?, status='returned'
+                    WHERE id=? AND returned_qty+?<=qty AND refunded_cents+?<=paid_share_cents""",
+                    (qty, amount, item.id, qty, amount),
+                ).rowcount,
+                "P05",
+                "退货数量或退款金额超过商品行剩余额度",
+            )
+            record_ids.extend([record_id, refund_id])
+        return record_ids
+
+    def _record_postgres_return(
+        self,
+        order: Order,
+        returns: list[tuple[OrderItem, int, int]],
+        reason: str,
+        destination: str,
+        total: int,
+    ) -> list[str]:
+        """Persist the Python-calculated amounts while the order lock is held."""
+        stamp = self.clock.now().isoformat()
+        row = self.db.execute(
+            f"""WITH requested AS (
+                SELECT * FROM unnest(?::text[], ?::integer[], ?::bigint[], ?::text[]) WITH ORDINALITY
+                    AS req(item_id, qty, amount, aftersale_status, position)
+            ), budget AS (
+                SELECT coalesce((SELECT amount_cents FROM order_refund_totals WHERE order_id=?), 0)
+                    <= ?::bigint - ?::bigint AS allowed
+            ), reserved AS (
+                UPDATE order_items i SET returned_qty=i.returned_qty+r.qty,
+                    refunded_cents=i.refunded_cents+r.amount, status='returned'
+                FROM requested r, budget b
+                WHERE b.allowed AND i.id=r.item_id AND i.order_id=?
+                    AND i.returned_qty+r.qty<=i.qty AND i.refunded_cents+r.amount<=i.paid_share_cents
+                RETURNING i.id AS item_id, i.order_id, r.qty, r.amount, r.aftersale_status
+            ), sales AS (
+                INSERT INTO aftersales (id, order_id, order_item_id, type, status, qty,
+                    amount_cents, reason, created_at)
+                SELECT {sequence_id_sql("aftersales")}, order_id, item_id, 'return',
+                    aftersale_status, qty, amount, ?, ?::timestamptz FROM reserved
+                RETURNING id, order_id, order_item_id, amount_cents, status
+            ), booked AS (
+                INSERT INTO refunds (id, order_id, aftersale_id, amount_cents, payment_method_id,
+                    status, created_at, execution_key, status_changed_at)
+                SELECT {sequence_id_sql("refunds")}, order_id, id, amount_cents, ?,
+                    CASE WHEN status='processing' THEN 'pending' ELSE 'success' END,
+                    ?::timestamptz, ?::text, ?::timestamptz FROM sales
+                RETURNING id, aftersale_id
+            )
+            SELECT budget.allowed, (
+                SELECT coalesce(jsonb_agg(jsonb_build_array(s.id, b.id) ORDER BY r.position), '[]')
+                FROM sales s JOIN booked b ON b.aftersale_id=s.id
+                JOIN requested r ON r.item_id=s.order_item_id
+            ) AS ids FROM budget""",
+            (
+                [item.id for item, _, _ in returns],
+                [qty for _, qty, _ in returns],
+                [amount for _, _, amount in returns],
+                [self._refund_outcome(amount) for _, _, amount in returns],
+                order.id,
+                order.paid_cents,
+                total,
+                order.id,
+                reason,
+                stamp,
+                destination,
+                stamp,
+                self.execution_key,
+                stamp if self.execution_key is not None else None,
+            ),
+        ).fetchone()
+        if not row["allowed"]:
+            raise ValueError("累计退款不能超过订单实付")
+        pairs = json.loads(row["ids"])
+        if len(pairs) != len(returns):
+            raise PolicyError(
+                CheckResult(violations=[_issue("P05", "退货数量或退款金额超过商品行剩余额度")])
+            )
+        return [record_id for pair in pairs for record_id in pair]
 
     def request_exchange(
         self,
@@ -744,11 +1075,18 @@ class Services:
         refund_payment_method_id: str | None = None,
     ) -> OperationResult:
         with transaction(self.db):
-            order = self.get_order(order_id)
+            order = self._order_for_write(order_id)
+            self._lock_skus([new_sku_id])
             line = self.get_line(order_id, order_item_id)
             target = self.get_sku(new_sku_id)
-            self._destination(order, refund_payment_method_id)
-            result = check_exchange(order, line, target, self.clock.now())
+            destination = self._destination(order, refund_payment_method_id)
+            result = check_exchange(
+                order,
+                line,
+                target,
+                self.clock.now(),
+                require_normal=is_postgres(self.db),
+            )
             self._enforce(result)
             amount, top_up = exchange_amount(line.item, target.price_cents)
             qty = line.item.qty - line.item.returned_qty
@@ -764,19 +1102,21 @@ class Services:
             )
             record_ids = [record_id]
             if not top_up and amount:
-                record_ids.append(self._refund(order, amount, record_id, refund_payment_method_id))
-                self.db.execute(
-                    "UPDATE order_items SET refunded_cents=refunded_cents+? WHERE id=?",
-                    (amount, order_item_id),
-                )
-            self.db.execute("UPDATE skus SET stock=stock-? WHERE id=?", (qty, new_sku_id))
-            self.db.execute(
-                "UPDATE order_items SET status='exchanged' WHERE id=?", (order_item_id,)
+                record_ids.append(self._refund(order, amount, record_id, destination))
+                self._reserve_line_refund(order_item_id, amount)
+            self._take_stock(new_sku_id, qty)
+            sql = "UPDATE order_items SET status='exchanged' WHERE id=?"
+            if is_postgres(self.db):
+                sql += " AND status='normal'"
+            self._require_updated(
+                self.db.execute(sql, (order_item_id,)).rowcount,
+                "P09",
+                "仅正常商品行可以换货",
             )
         return OperationResult(
             order_id=order_id,
             amount_cents=amount,
-            status="awaiting_payment" if top_up else "completed",
+            status="awaiting_payment" if top_up else self._refund_outcome(amount),
             record_ids=record_ids,
         )
 
@@ -791,7 +1131,10 @@ class Services:
         requests = [PurchaseItem.model_validate(item) for item in items]
         if user_coupon_id is not None and not isinstance(user_coupon_id, str):
             raise PolicyError(CheckResult(violations=[_issue("P13", "每单只能指定一张优惠券")]))
-        with transaction(self.db):
+        with (
+            transaction(self.db),
+            self.lock_action_resources(None, [item.sku_id for item in requests], user_coupon_id),
+        ):
             user = self.db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
             if user is None:
                 raise ValueError("用户不存在")
@@ -809,17 +1152,14 @@ class Services:
             totals = [sku.price_cents * qty for sku, qty in lines]
             discount = sum(coupon.discount_cents for owned, coupon in coupons)
             shares = paid_shares(totals, discount)
-            order_id = next_id(self.db, "orders")
             destination = (
                 Address.model_validate(address)
                 if address is not None
                 else Address.model_validate_json(user["default_address"])
             )
             stamp = self.clock.now().isoformat()
-            insert(
-                self.db,
+            order_id = self._insert_record(
                 "orders",
-                id=order_id,
                 user_id=user_id,
                 status="pending_shipment",
                 address=destination.model_dump_json(),
@@ -836,10 +1176,8 @@ class Services:
                 price_protected=0,
             )
             for (sku, qty), share in zip(lines, shares, strict=True):
-                insert(
-                    self.db,
+                self._insert_record(
                     "order_items",
-                    id=next_id(self.db, "order_items"),
                     order_id=order_id,
                     sku_id=sku.id,
                     qty=qty,
@@ -849,18 +1187,34 @@ class Services:
                     returned_qty=0,
                     refunded_cents=0,
                 )
-                self.db.execute("UPDATE skus SET stock=stock-? WHERE id=?", (qty, sku.id))
+                self._take_stock(sku.id, qty)
             if user_coupon_id:
-                self.db.execute(
-                    "UPDATE user_coupons SET status='used', used_order_id=? WHERE id=?",
-                    (order_id, user_coupon_id),
-                )
+                if is_postgres(self.db):
+                    self._require_updated(
+                        self.db.execute(
+                            "UPDATE user_coupons SET status='used', used_order_id=? WHERE id=? AND status='unused'",
+                            (order_id, user_coupon_id),
+                        ).rowcount,
+                        "P13",
+                        "优惠券已使用或不可用",
+                    )
+                else:
+                    self.db.execute(
+                        "UPDATE user_coupons SET status='used', used_order_id=? WHERE id=?",
+                        (order_id, user_coupon_id),
+                    )
         return OperationResult(
             order_id=order_id, amount_cents=sum(shares), status="pending_shipment"
         )
 
     def submit_approval(
-        self, order_id: str, request: ApprovalRequest, reason: str
+        self,
+        order_id: str,
+        request: ApprovalRequest,
+        reason: str,
+        *,
+        session_id: str | None = None,
+        requested_amount_cents: int | None = None,
     ) -> OperationResult:
         request = ApprovalRequest.model_validate(request)
         args = dict(request.args)
@@ -868,12 +1222,14 @@ class Services:
             raise ValueError("Approval order_id conflicts with the target order")
         args["order_id"] = order_id
         with transaction(self.db):
-            order = self.get_order(order_id)
-            record_id = next_id(self.db, "approvals")
-            insert(
-                self.db,
+            order = self._order_for_write(order_id)
+            metadata = (
+                {"session_id": session_id, "requested_amount_cents": requested_amount_cents}
+                if session_id is not None
+                else {}
+            )
+            record_id = self._insert_record(
                 "approvals",
-                id=record_id,
                 user_id=order.user_id,
                 order_id=order_id,
                 action=request.action,
@@ -881,17 +1237,15 @@ class Services:
                 reason=reason,
                 status="pending",
                 created_at=self.clock.now().isoformat(),
+                **metadata,
             )
         return OperationResult(order_id=order_id, status="pending", record_ids=[record_id])
 
     def transfer_to_human(self, user_id: str | None, summary: str, reason: str) -> str:
         """Record a handoff, including an unauthenticated request."""
         with transaction(self.db):
-            record_id = next_id(self.db, "handoffs")
-            insert(
-                self.db,
+            record_id = self._insert_record(
                 "handoffs",
-                id=record_id,
                 user_id=user_id,
                 summary=summary,
                 reason=reason,

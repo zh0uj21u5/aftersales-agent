@@ -215,6 +215,10 @@ def run_trial(
             return Usage(
                 input_tokens=sum(e.data["tokens"]["input_tokens"] for e in selected),
                 output_tokens=sum(e.data["tokens"]["output_tokens"] for e in selected),
+                cached_tokens=sum(e.data["tokens"].get("cached_tokens", 0) for e in selected),
+                cache_creation_tokens=sum(
+                    e.data["tokens"].get("cache_creation_tokens", 0) for e in selected
+                ),
             )
 
         def cost_for(selected: list[TraceEvent]) -> str | None:

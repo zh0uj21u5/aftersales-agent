@@ -26,7 +26,7 @@ def shop() -> Iterator[Services]:
 def block_unit_test_network(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    if request.node.get_closest_marker("llm") is None:
+    if all(request.node.get_closest_marker(marker) is None for marker in ("llm", "integration")):
         original_connect = socket.socket.connect
         pair_code = getattr(socket.socketpair, "__code__", None)
 

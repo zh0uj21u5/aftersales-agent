@@ -1,6 +1,7 @@
 """Read policy sections by their explicit topic markers."""
 
 import re
+from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
@@ -20,8 +21,13 @@ PolicyTopic = Literal[
 POLICY_PATH = Path(__file__).with_name("POLICY.md")
 
 
+@lru_cache(maxsize=4)
+def _read_policy(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
 def policy_text() -> str:
-    return POLICY_PATH.read_text(encoding="utf-8")
+    return _read_policy(POLICY_PATH)
 
 
 def lookup_topic(topic: PolicyTopic) -> str:

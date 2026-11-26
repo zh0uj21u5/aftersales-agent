@@ -1,12 +1,13 @@
 """Provider-neutral messages, SDK adapters, deterministic mocks, and disk cache."""
 
+import asyncio
 import hashlib
 import inspect
 import json
 import os
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Literal, Protocol, TypeVar
@@ -19,6 +20,10 @@ from aftersales.core.config import load_settings
 from aftersales.tools.registry import ToolSpec
 
 
+class InferenceUnavailable(RuntimeError):
+    """A runtime limit prevents a new model request."""
+
+
 class ToolCall(BaseModel):
     id: str = Field(min_length=1)
     name: str = Field(min_length=1)
@@ -28,6 +33,14 @@ class ToolCall(BaseModel):
 class Usage(BaseModel):
     input_tokens: int = Field(default=0, ge=0)
     output_tokens: int = Field(default=0, ge=0)
+    cached_tokens: int = Field(default=0, ge=0)
+    cache_creation_tokens: int = Field(default=0, ge=0)
+
+    def add(self, other: "Usage") -> None:
+        self.input_tokens += other.input_tokens
+        self.output_tokens += other.output_tokens
+        self.cached_tokens += other.cached_tokens
+        self.cache_creation_tokens += other.cache_creation_tokens
 
 
 class LLMResponse(BaseModel):
@@ -65,6 +78,41 @@ class LLMClient(Protocol):
     ) -> LLMResponse: ...
 
 
+class AsyncLLMClient(Protocol):
+    async def chat(
+        self,
+        system: str,
+        messages: list[Message],
+        tools: list[ToolSpec],
+        temperature: float = 0.0,
+        max_tokens: int = 2048,
+    ) -> LLMResponse: ...
+
+
+Client = LLMClient | AsyncLLMClient
+DeltaSink = Callable[[str], None]
+PROMPT_RUNTIME_BOUNDARY = "\n<runtime_context>\n"
+
+
+async def chat_async(
+    client: Client,
+    system: str,
+    messages: list[Message],
+    tools: list[ToolSpec],
+    temperature: float = 0.0,
+    max_tokens: int = 2048,
+    *,
+    on_delta: DeltaSink | None = None,
+) -> LLMResponse:
+    if on_delta is not None and (stream := getattr(client, "stream_chat", None)):
+        return await stream(system, messages, tools, temperature, max_tokens, on_delta)
+    if async_chat := getattr(client, "chat_async", None):
+        return await async_chat(system, messages, tools, temperature, max_tokens)
+    if inspect.iscoroutinefunction(client.chat):
+        return await client.chat(system, messages, tools, temperature, max_tokens)
+    return await asyncio.to_thread(client.chat, system, messages, tools, temperature, max_tokens)
+
+
 class LLMRequest(BaseModel):
     system: str
     messages: list[Message]
@@ -89,15 +137,45 @@ PRICING: dict[str, tuple[Decimal, Decimal]] = {
 }
 
 
-def estimate_cost(model: str, usage: Usage) -> Decimal | None:
+PROMPT_CACHE_PRICING: dict[str, tuple[Decimal, Decimal]] = {
+    # USD per million cached-read and cache-creation tokens, at the provider's reference tier.
+    "gpt-4.1-mini": (Decimal("0.10"), Decimal("0.40")),
+    "gpt-4.1-mini-2025-04-14": (Decimal("0.10"), Decimal("0.40")),
+    "claude-haiku-4-5-20251001": (Decimal("0.10"), Decimal("1.25")),
+    "deepseek-v4-flash": (Decimal("0.006"), Decimal("0.30")),
+    "deepseek-v4.1-flash": (Decimal("0.006"), Decimal("0.30")),
+    "deepseek-v4-pro": (Decimal("0.044"), Decimal("1.32")),
+}
+
+
+def estimate_cost(model: str, usage: Usage, *, prompt_cache: bool = False) -> Decimal | None:
     """Return USD, or None when a model has no verified rate."""
     rates = PRICING.get(model)
     if rates is None:
         return None
-    return (usage.input_tokens * rates[0] + usage.output_tokens * rates[1]) / 1_000_000
+    read_rate, creation_rate = PROMPT_CACHE_PRICING.get(model, (rates[0], rates[0]))
+    read = min(usage.cached_tokens, usage.input_tokens) if prompt_cache else 0
+    created = min(usage.cache_creation_tokens, usage.input_tokens - read) if prompt_cache else 0
+    uncached = usage.input_tokens - read - created
+    return (
+        uncached * rates[0]
+        + read * read_rate
+        + created * creation_rate
+        + usage.output_tokens * rates[1]
+    ) / 1_000_000
 
 
 T = TypeVar("T")
+
+
+def run_sync(coro: Coroutine[Any, Any, T]) -> T:
+    return asyncio.run(coro)
+
+
+def _sync_sleep(delay: float) -> None:
+    time.sleep(delay)
+
+
 RETRYABLE = (
     openai.APIConnectionError,
     openai.RateLimitError,
@@ -116,6 +194,47 @@ def _retry(call: Callable[[], T], sleep: Callable[[float], None]) -> T:
                 raise
             sleep(2**attempt)
     raise AssertionError("unreachable")
+
+
+async def _retry_async(
+    call: Callable[[], Awaitable[T]], sleep: Callable[[float], Awaitable[None]]
+) -> T:
+    for attempt in range(3):
+        try:
+            return await call()
+        except RETRYABLE:
+            if attempt == 2:
+                raise
+            await sleep(2**attempt)
+    raise AssertionError("unreachable")
+
+
+class StreamInterrupted(RuntimeError):
+    """The request failed after the consumer had already seen model text."""
+
+
+async def _retry_stream(
+    call: Callable[[DeltaSink], Awaitable[LLMResponse]],
+    on_delta: DeltaSink,
+    sleep: Callable[[float], Awaitable[None]],
+) -> LLMResponse:
+    sent = False
+
+    def forward(text: str) -> None:
+        nonlocal sent
+        if text:
+            on_delta(text)
+            sent = True
+
+    async def request() -> LLMResponse:
+        try:
+            return await call(forward)
+        except RETRYABLE as exc:
+            if sent:
+                raise StreamInterrupted("Streaming response interrupted") from exc
+            raise
+
+    return await _retry_async(request, sleep)
 
 
 def _openai_messages(system: str, messages: list[Message]) -> list[dict[str, Any]]:
@@ -154,7 +273,7 @@ class OpenAICompatClient:
         base_url: str | None = None,
         *,
         sdk: Any = None,
-        sleep: Callable[[float], None] = time.sleep,
+        sleep: Callable[[float], None] = _sync_sleep,
     ) -> None:
         self.model = model
         self.cache_identity = f"openai:{base_url or 'https://api.openai.com/v1'}:{model}"
@@ -173,6 +292,19 @@ class OpenAICompatClient:
         temperature: float = 0.0,
         max_tokens: int = 2048,
     ) -> LLMResponse:
+        kwargs = self._request(system, messages, tools, temperature, max_tokens)
+        return self._response(
+            _retry(lambda: self._sdk.chat.completions.create(**kwargs), self._sleep)
+        )
+
+    def _request(
+        self,
+        system: str,
+        messages: list[Message],
+        tools: list[ToolSpec],
+        temperature: float,
+        max_tokens: int,
+    ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "model": self.model,
             "messages": _openai_messages(system, messages),
@@ -191,17 +323,26 @@ class OpenAICompatClient:
                 }
                 for spec in tools
             ]
-        raw = _retry(lambda: self._sdk.chat.completions.create(**kwargs), self._sleep)
+        return kwargs
+
+    @staticmethod
+    def _response(raw: Any) -> LLMResponse:
+        meter = raw.usage
+        details = getattr(meter, "prompt_tokens_details", None)
+        cached = getattr(details, "cached_tokens", None)
+        if cached is None:
+            cached = getattr(meter, "prompt_cache_hit_tokens", None)
         usage = Usage(
-            input_tokens=raw.usage.prompt_tokens if raw.usage else 0,
-            output_tokens=raw.usage.completion_tokens if raw.usage else 0,
+            input_tokens=meter.prompt_tokens if meter else 0,
+            output_tokens=meter.completion_tokens if meter else 0,
+            cached_tokens=cached or 0,
         )
         payload = raw.model_dump(mode="json")
         if not raw.choices:
             return LLMResponse(stop_reason="error", usage=usage, raw=payload)
         choice = raw.choices[0]
         stop = {"stop": "end_turn", "tool_calls": "tool_use", "length": "max_tokens"}.get(
-            choice.finish_reason, "error"
+            getattr(choice, "finish_reason", None), "error"
         )
         try:
             calls = [
@@ -262,7 +403,7 @@ class AnthropicClient:
         base_url: str | None = None,
         *,
         sdk: Any = None,
-        sleep: Callable[[float], None] = time.sleep,
+        sleep: Callable[[float], None] = _sync_sleep,
     ) -> None:
         self.model = model
         self.cache_identity = f"anthropic:{base_url or 'https://api.anthropic.com'}:{model}"
@@ -287,6 +428,17 @@ class AnthropicClient:
         temperature: float = 0.0,
         max_tokens: int = 2048,
     ) -> LLMResponse:
+        kwargs = self._request(system, messages, tools, temperature, max_tokens)
+        return self._response(_retry(lambda: self._sdk.messages.create(**kwargs), self._sleep))
+
+    def _request(
+        self,
+        system: str,
+        messages: list[Message],
+        tools: list[ToolSpec],
+        temperature: float,
+        max_tokens: int,
+    ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "model": self.model,
             "system": system,
@@ -306,12 +458,17 @@ class AnthropicClient:
                 }
                 for spec in tools
             ]
-        raw = _retry(lambda: self._sdk.messages.create(**kwargs), self._sleep)
+        return kwargs
+
+    @staticmethod
+    def _response(raw: Any) -> LLMResponse:
         usage = Usage(
             input_tokens=raw.usage.input_tokens
             + (raw.usage.cache_creation_input_tokens or 0)
             + (raw.usage.cache_read_input_tokens or 0),
             output_tokens=raw.usage.output_tokens,
+            cached_tokens=raw.usage.cache_read_input_tokens or 0,
+            cache_creation_tokens=raw.usage.cache_creation_input_tokens or 0,
         )
         stop = {
             "end_turn": "end_turn",
@@ -335,6 +492,145 @@ class AnthropicClient:
             usage=usage,
             raw=raw.model_dump(mode="json"),
         )
+
+
+class AsyncOpenAICompatClient(OpenAICompatClient):
+    def __init__(
+        self,
+        model: str,
+        api_key: str,
+        base_url: str | None = None,
+        *,
+        sdk: Any = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
+        super().__init__(
+            model,
+            api_key,
+            base_url,
+            sdk=sdk
+            if sdk is not None
+            else openai.AsyncOpenAI(
+                api_key=api_key, base_url=base_url, max_retries=0, timeout=60.0
+            ),
+        )
+        self._async_sleep = sleep
+
+    async def chat(
+        self,
+        system: str,
+        messages: list[Message],
+        tools: list[ToolSpec],
+        temperature: float = 0.0,
+        max_tokens: int = 2048,
+    ) -> LLMResponse:
+        kwargs = self._request(system, messages, tools, temperature, max_tokens)
+        raw = await _retry_async(
+            lambda: self._sdk.chat.completions.create(**kwargs), self._async_sleep
+        )
+        return self._response(raw)
+
+    async def stream_chat(
+        self,
+        system: str,
+        messages: list[Message],
+        tools: list[ToolSpec],
+        temperature: float,
+        max_tokens: int,
+        on_delta: DeltaSink,
+    ) -> LLMResponse:
+        kwargs = self._request(system, messages, tools, temperature, max_tokens)
+
+        async def request(emit: DeltaSink) -> LLMResponse:
+            manager = self._sdk.chat.completions.stream(
+                **kwargs, stream_options={"include_usage": True}
+            )
+            async with manager as stream:
+                async for event in stream:
+                    if event.type == "content.delta":
+                        emit(event.delta)
+                # The parsed helper raises on length, losing the stop reason and usage.
+                return self._response(stream.current_completion_snapshot)
+
+        return await _retry_stream(request, on_delta, self._async_sleep)
+
+    async def aclose(self) -> None:
+        await self._sdk.close()
+
+
+class AsyncAnthropicClient(AnthropicClient):
+    def __init__(
+        self,
+        model: str,
+        api_key: str,
+        base_url: str | None = None,
+        *,
+        sdk: Any = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
+        super().__init__(
+            model,
+            api_key,
+            base_url,
+            sdk=sdk
+            if sdk is not None
+            else anthropic.AsyncAnthropic(
+                api_key=api_key, base_url=base_url, max_retries=0, timeout=60.0
+            ),
+        )
+        self._async_sleep = sleep
+
+    def _request(
+        self,
+        system: str,
+        messages: list[Message],
+        tools: list[ToolSpec],
+        temperature: float,
+        max_tokens: int,
+    ) -> dict[str, Any]:
+        kwargs = super()._request(system, messages, tools, temperature, max_tokens)
+        prefix, separator, suffix = system.partition(PROMPT_RUNTIME_BOUNDARY)
+        if prefix:
+            kwargs["system"] = [
+                {"type": "text", "text": prefix, "cache_control": {"type": "ephemeral"}}
+            ]
+            if separator:
+                kwargs["system"].append({"type": "text", "text": suffix})
+        return kwargs
+
+    async def chat(
+        self,
+        system: str,
+        messages: list[Message],
+        tools: list[ToolSpec],
+        temperature: float = 0.0,
+        max_tokens: int = 2048,
+    ) -> LLMResponse:
+        kwargs = self._request(system, messages, tools, temperature, max_tokens)
+        raw = await _retry_async(lambda: self._sdk.messages.create(**kwargs), self._async_sleep)
+        return self._response(raw)
+
+    async def stream_chat(
+        self,
+        system: str,
+        messages: list[Message],
+        tools: list[ToolSpec],
+        temperature: float,
+        max_tokens: int,
+        on_delta: DeltaSink,
+    ) -> LLMResponse:
+        kwargs = self._request(system, messages, tools, temperature, max_tokens)
+
+        async def request(emit: DeltaSink) -> LLMResponse:
+            async with self._sdk.messages.stream(**kwargs) as stream:
+                async for delta in stream.text_stream:
+                    emit(delta)
+                return self._response(await stream.get_final_message())
+
+        return await _retry_stream(request, on_delta, self._async_sleep)
+
+    async def aclose(self) -> None:
+        await self._sdk.close()
 
 
 class MockLLM:
@@ -363,6 +659,24 @@ class MockLLM:
         if not self.script:
             raise RuntimeError("MockLLM script exhausted")
         return self.script.pop(0).model_copy(deep=True)
+
+
+class AsyncMockLLM:
+    def __init__(self, script: list[LLMResponse], delay: float = 0.0) -> None:
+        self.mock = MockLLM(script)
+        self.requests = self.mock.requests
+        self.delay = delay
+
+    async def chat(
+        self,
+        system: str,
+        messages: list[Message],
+        tools: list[ToolSpec],
+        temperature: float = 0.0,
+        max_tokens: int = 2048,
+    ) -> LLMResponse:
+        await asyncio.sleep(self.delay)
+        return self.mock.chat(system, messages, tools, temperature, max_tokens)
 
 
 class CachedClient:
@@ -442,4 +756,21 @@ def make_client(
         env_file, provider=provider, model=model, base_url=base_url, api_key=api_key
     )
     client_type = AnthropicClient if settings.provider == "anthropic" else OpenAICompatClient
+    return client_type(settings.model, settings.api_key.get_secret_value(), settings.base_url)
+
+
+def make_async_client(
+    provider: str | None = None,
+    model: str | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    *,
+    env_file: str | Path = ".env",
+) -> AsyncOpenAICompatClient | AsyncAnthropicClient:
+    settings = load_settings(
+        env_file, provider=provider, model=model, base_url=base_url, api_key=api_key
+    )
+    client_type = (
+        AsyncAnthropicClient if settings.provider == "anthropic" else AsyncOpenAICompatClient
+    )
     return client_type(settings.model, settings.api_key.get_secret_value(), settings.base_url)

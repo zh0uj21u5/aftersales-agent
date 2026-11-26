@@ -4,8 +4,10 @@ from pydantic import BaseModel
 
 from aftersales.core.hooks import Allow, Deny
 from aftersales.core.llm import ToolCall
+from aftersales.domain.db import is_postgres
 from aftersales.domain.models import CheckResult, Violation
 from aftersales.domain.services import (
+    Services,
     check_cancel_order,
     check_exchange,
     check_modify_address,
@@ -18,7 +20,9 @@ AUTH_TOOLS = {"find_user_by_phone", "find_user_by_order"}
 PUBLIC_TOOLS = AUTH_TOOLS | {"lookup_policy", "transfer_to_human", "update_todo"}
 
 
-def check_access(ctx: ToolContext, call: ToolCall) -> Allow | Deny:
+def check_access(
+    ctx: ToolContext, call: ToolCall, *, service: Services | None = None
+) -> Allow | Deny:
     """Authentication tools verify their own credentials before assigning identity."""
     if call.name in PUBLIC_TOOLS:
         return Allow()
@@ -28,19 +32,29 @@ def check_access(ctx: ToolContext, call: ToolCall) -> Allow | Deny:
     if "user_id" in call.arguments and call.arguments["user_id"] != user_id:
         return Deny("只能访问本人资源", ["P01"])
     if "order_id" in call.arguments:
-        row = (
-            ctx.services()
-            .db.execute("SELECT user_id FROM orders WHERE id=?", (call.arguments["order_id"],))
-            .fetchone()
-        )
-        if row is None or row[0] != user_id:
+        order_id = call.arguments["order_id"]
+        if service is None:
+            row = (
+                ctx.services()
+                .db.execute("SELECT user_id FROM orders WHERE id=?", (order_id,))
+                .fetchone()
+            )
+            owner = row[0] if row is not None else None
+        else:
+            try:
+                owner = service.get_order(order_id).user_id
+            except ValueError:
+                owner = None
+        if owner != user_id:
             return Deny("订单不存在或不属于当前用户", ["P01"])
     return Allow()
 
 
-def business_check(ctx: ToolContext, name: str, args: BaseModel) -> CheckResult:
+def business_check(
+    ctx: ToolContext, name: str, args: BaseModel, *, service: Services | None = None
+) -> CheckResult:
     """Load snapshots; all business decisions live in services.check_* functions."""
-    service = ctx.services()
+    service = service if service is not None else ctx.services()
     if name == "create_order":
         result = service.check_purchase(
             args.user_id, args.items, args.payment_method_id, args.user_coupon_id
@@ -73,6 +87,7 @@ def business_check(ctx: ToolContext, name: str, args: BaseModel) -> CheckResult:
                 service.get_line(order.id, args.order_item_id),
                 service.get_sku(args.new_sku_id),
                 service.clock.now(),
+                require_normal=is_postgres(service.db),
             )
     else:
         return CheckResult(violations=[Violation(rule_id="DATA", reason="写工具未配置规则校验")])
