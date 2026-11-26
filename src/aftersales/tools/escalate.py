@@ -3,6 +3,7 @@
 from pydantic import JsonValue
 
 from aftersales.domain.models import Action, ApprovalRequest, OperationResult
+from aftersales.policy.proposal import retire_submitted_approval
 from aftersales.tools.registry import ToolContext, tool
 
 
@@ -12,7 +13,10 @@ def submit_approval(
 ) -> OperationResult:
     """Submit a pending human approval for a large after-sales refund."""
     request = ApprovalRequest.model_validate({"action": action, "args": args})
-    return ctx.services().submit_approval(order_id, request, reason)
+    result = ctx.services().submit_approval(order_id, request, reason)
+    if ctx.config.proposal_gate:
+        retire_submitted_approval(ctx.session, order_id, request)
+    return result
 
 
 @tool(name="transfer_to_human", permission="escalate", policy_topics=["escalation"])

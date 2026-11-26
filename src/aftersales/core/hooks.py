@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Literal
 from pydantic import ValidationError
 
 if TYPE_CHECKING:
+    from aftersales.core.config import AgentConfig
     from aftersales.core.llm import LLMClient, LLMResponse, ToolCall
     from aftersales.core.loop import Session, TurnResult
     from aftersales.core.tracing import TraceWriter
@@ -44,7 +45,9 @@ class Hooks:
     def after_tool(self, ctx: ToolContext, call: ToolCall, result: ToolResult) -> None:
         pass
 
-    def on_turn_end(self, session: Session, result: TurnResult) -> None:
+    def on_turn_end(
+        self, session: Session, result: TurnResult, *, config: AgentConfig | None = None
+    ) -> None:
         pass
 
 
@@ -91,11 +94,64 @@ class PolicyHooks(Hooks):
 
     def on_user_message(self, ctx: ToolContext) -> None:
         if ctx.config.confirm_gate and ctx.config.proposal_gate:
-            from aftersales.policy.proposal import authorize_natural_language
-
             self.before_llm(ctx.session)
-            authorize_natural_language(
-                ctx.session, lambda: self._agrees(ctx.session, ctx.config.confirm_mode)
+            if ctx.config.confirm_mode == "llm":
+                self._authorize_semantic(ctx.session)
+            else:
+                from aftersales.policy.proposal import authorize_natural_language
+
+                authorize_natural_language(
+                    ctx.session, lambda: self._agrees(ctx.session, ctx.config.confirm_mode)
+                )
+
+    def _authorize_semantic(self, session: Session) -> None:
+        from aftersales.policy.confirmation import classify_confirmation
+        from aftersales.policy.proposal import (
+            decide_proposal,
+            format_proposal_summary,
+            invalidate,
+            latest_proposal,
+        )
+
+        proposal = latest_proposal(session)
+        previous = session.confirmation_proposal
+        if (
+            proposal is None
+            or proposal.status not in {"pending", "approved"}
+            or not previous
+            or session.confirmation_user_index < 0
+            or session.confirmation_checked
+        ):
+            return
+        if proposal.status == "pending" and (
+            session.presented_proposal_version != proposal.version
+            or not previous.endswith("\n\n" + format_proposal_summary(proposal))
+        ):
+            return
+        buyer = session.messages[session.confirmation_user_index].content or ""
+        session.confirmation_checked = True
+        verdict = classify_confirmation(self.classifier, proposal, previous, buyer)
+        if verdict == "APPROVE":
+            if proposal.status == "pending":
+                decide_proposal(
+                    session,
+                    proposal.proposal_id,
+                    proposal.version,
+                    "approve",
+                    source="natural_language",
+                )
+            session.confirmation_available = True
+        elif verdict == "REJECT":
+            proposal.confirm_source = "natural_language"
+            invalidate(proposal, "rejected")
+        if self.trace:
+            self.trace.emit(
+                "proposal_confirmation",
+                proposal_id=proposal.proposal_id,
+                version=proposal.version,
+                verdict=verdict or "ERROR",
+                status=proposal.status,
+                user_index=session.confirmation_user_index,
             )
 
     def before_llm(self, session: Session) -> None:
@@ -213,10 +269,15 @@ class PolicyHooks(Hooks):
             from aftersales.domain.services import PolicyError
             from aftersales.policy.proposal import bind_action
 
-            try:
-                ctx.authorized_action = bind_action(ctx, call.name, args)
-            except PolicyError as exc:
-                verdict = Deny(str(exc), exc.rule_ids)
+            if ctx.config.confirm_mode == "llm" and not session.confirmation_available:
+                verdict = Deny(
+                    "本轮尚未通过整份方案的语义确认，请先展示方案并征求用户确认", ["P02"]
+                )
+            else:
+                try:
+                    ctx.authorized_action = bind_action(ctx, call.name, args)
+                except PolicyError as exc:
+                    verdict = Deny(str(exc), exc.rule_ids)
             self._record("confirm_verdict", ctx, call, verdict, enabled=True)
             return verdict
         if ctx.config.confirm_gate:
@@ -245,16 +306,25 @@ class PolicyHooks(Hooks):
             consume_action(ctx.session, ctx.authorized_action, success=not result.is_error)
             ctx.authorized_action = None
 
-    def on_turn_end(self, session: Session, result: TurnResult) -> None:
-        from aftersales.policy.proposal import presentation_matches
+    def on_turn_end(
+        self, session: Session, result: TurnResult, *, config: AgentConfig | None = None
+    ) -> None:
+        from aftersales.policy.proposal import format_proposal_summary, presentation_matches
 
         session.confirmation_available = session.confirmed_batch = False
         if session.proposals:
             proposal = session.proposals[-1]
             if proposal.status == "pending":
+                semantic = (
+                    config is not None and config.proposal_gate and config.confirm_mode == "llm"
+                )
                 session.presented_proposal_version = (
                     proposal.version
                     if result.stop_reason == "end_turn"
-                    and presentation_matches(result.reply, proposal)
+                    and (
+                        result.reply.endswith("\n\n" + format_proposal_summary(proposal))
+                        if semantic
+                        else presentation_matches(result.reply, proposal)
+                    )
                     else None
                 )

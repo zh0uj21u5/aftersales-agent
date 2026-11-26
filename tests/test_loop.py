@@ -301,7 +301,9 @@ def test_hook_order_and_denial_prevents_side_effect() -> None:
         def after_tool(self, ctx: ToolContext, call: ToolCall, result: ToolResult) -> None:
             events.append("after_tool")
 
-        def on_turn_end(self, session: Session, result: TurnResult) -> None:
+        def on_turn_end(
+            self, session: Session, result: TurnResult, *, config: AgentConfig | None = None
+        ) -> None:
             events.append("on_turn_end")
 
     agent, _, session = build([using(call("fail")), answer()])

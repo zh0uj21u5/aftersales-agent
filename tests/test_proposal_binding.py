@@ -15,7 +15,12 @@ from aftersales.core.runtime import build_system
 from aftersales.core.tracing import TraceWriter, read_trace
 from aftersales.domain.db import dump_hashes
 from aftersales.domain.services import PolicyError, Services
-from aftersales.policy.proposal import decide_proposal, presentation_matches
+from aftersales.policy.proposal import (
+    decide_proposal,
+    format_proposal_summary,
+    presentation_matches,
+    whole_plan_acknowledgment,
+)
 from aftersales.tools import build_registry
 from aftersales.tools.registry import ToolContext
 from evals.models import load_tasks
@@ -108,6 +113,9 @@ def test_single_action_zero_extra_turn_read_survival_and_consumption(shop: Servi
     assert p.created_at == shop.clock.now().isoformat()
     assert p.actions[0].preview_amount_cents is None
     assert decoded(results(session)[0])["proposal"]["proposal_id"] == "P0001"
+    card = format_proposal_summary(p)
+    assert "公司88号" in card and "不涉及金额" in card and "¥" not in card
+    assert turn.reply.endswith(card) and session.messages[-1].content == turn.reply
     agent.respond(session, "好的，确认，就这么办")
     assert p.status == "consumed" and p.actions[0].status == "executed"
     assert p.confirm_source == "natural_language"
@@ -138,6 +146,8 @@ def test_compound_independent_actions_in_either_order(shop: Services, reverse: b
     )
     agent.respond(session, "改址和价保")
     assert session.proposals[0].actions[1].preview_amount_cents == 5700
+    assert presentation_matches("改址费用：¥0.00，另退差 ¥57.00", session.proposals[0])
+    assert not presentation_matches("改址并退差 ¥0.00", session.proposals[0])
     agent.respond(session, "确认")
     assert session.proposals[0].status == "consumed"
     assert [a.status for a in session.proposals[0].actions] == ["executed", "executed"]
@@ -381,7 +391,6 @@ def test_partial_consent_v2_and_deleted_v1_action_replay(shop: Services) -> None
         "yes, only change address",
         "确认，但请等等",
         "好的，地址改到广州市",
-        "确认改地址",
         "好的，退两件",
         "同意，数量为2",
         "确认，地址上海市示例路99号",
@@ -577,6 +586,7 @@ def test_large_refund_proposes_p08_and_hands_off_to_approval(shop: Services) -> 
     agent.respond(session, "退三件")
     p = session.proposals[0]
     assert p.actions[0].requires_approval and p.actions[0].preview_amount_cents == 45000
+    assert "退款 ¥450.00" in format_proposal_summary(p) and "P08" in format_proposal_summary(p)
     assert "submit_approval" in decoded(results(session)[0])["guidance"][-1]
     assert dump_hashes(shop.db) == before
     agent.respond(session, "确认")
@@ -587,6 +597,54 @@ def test_large_refund_proposes_p08_and_hands_off_to_approval(shop: Services) -> 
         shop.db.execute("SELECT status FROM approvals WHERE order_id='O1005'").fetchone()[0]
         == "pending"
     )
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_approval_submission_retires_only_covered_p08_card(shop: Services, mixed: bool) -> None:
+    # Three return units cost 45000 cents > 20000. One new S0001 costs 10000 cents.
+    refund = action(
+        "request_return",
+        order_id="O1005",
+        items=[{"order_item_id": "OI00005", "qty": 3}],
+        reason="七天无理由",
+    )
+    purchase = action(
+        "create_order",
+        user_id="U005",
+        items=[{"sku_id": "S0001", "qty": 1}],
+        payment_method_id="PM0005",
+    )
+    submit = call(
+        "submit_approval",
+        order_id="O1005",
+        action="request_return",
+        args=refund["arguments"],
+        reason="大额审批",
+    )
+    script = [propose(refund, purchase) if mixed else propose(refund), using(submit)]
+    reply = "O1005 退货申请已提交人工审批。"
+    if mixed:
+        reply += "新订单实付 ¥100.00，请确认。"
+    script.append(LLMResponse(text=reply))
+    if mixed:
+        script.extend([using(as_call(purchase)), LLMResponse(text="已下单")])
+    agent, session, _ = setup_agent(shop, script, user="U005")
+
+    result = agent.respond(session, "提交大额审批" + ("，并新下单" if mixed else ""))
+    assert session.proposals[0].status == "superseded"
+    assert shop.refunded_cents("O1005") == 0
+    assert shop.db.execute("SELECT count(*) FROM approvals").fetchone()[0] == 1
+    if mixed:
+        pending = session.proposals[-1]
+        assert pending.version == 2 and pending.status == "pending"
+        assert [a.tool_name for a in pending.actions] == ["create_order"]
+        card = result.reply.split("服务端待确认方案", 1)[1]
+        assert "实付 ¥100.00" in card and "O1005" not in card
+        agent.respond(session, "好的，确认下单。")
+        assert pending.status == "consumed"
+    else:
+        assert result.reply == reply
+        assert session.presented_proposal_version is None
 
 
 @pytest.mark.parametrize("decision", ["approve", "reject"])
@@ -861,6 +919,10 @@ def test_return_exchange_and_top_up_complete_with_service_preview(
     )
     agent.respond(session, "退换")
     assert session.proposals[0].actions[0].preview_amount_cents == amount
+    card = format_proposal_summary(session.proposals[0])
+    assert {"return": "退款 ¥150.00", "exchange": "退款 ¥20.00", "top_up": "待补款 ¥100.00"}[
+        kind
+    ] in card
     agent.respond(session, "确认，按整份方案执行")
     assert session.proposals[0].status == "consumed"
     assert decoded(results(session)[-1])["status"] == status
@@ -901,6 +963,11 @@ def test_purchase_all_structured_fields_are_bound(shop: Services, field: str) ->
     agent.respond(session, "购买")
     canonical = session.proposals[0].actions[0].canonical_args
     assert canonical["user_coupon_id"] is None and canonical["address"] is None
+    card = format_proposal_summary(session.proposals[0])
+    assert all(
+        part in card
+        for part in ("新订单", "S0001", "PM0006", "默认收货地址", "示例路6号", "实付 ¥200.00")
+    )
     before = dump_hashes(shop.db)
     agent.respond(session, "确认")
     assert "[POLICY_VIOLATION P02]" in results(session)[-1].content
@@ -1021,18 +1088,22 @@ def test_service_failure_invalidates_unspent_authorization(
 
 
 @pytest.mark.parametrize(
-    "classification",
+    "classification,status",
     [
-        LLMResponse(text="YES"),
-        LLMResponse(text="NO"),
-        LLMResponse(text="YES", stop_reason="max_tokens"),
+        (LLMResponse(text="  approve\n"), "consumed"),
+        (LLMResponse(text="REJECT"), "rejected"),
+        (LLMResponse(text="NEUTRAL"), "pending"),
+        (LLMResponse(text="APPROVE.", stop_reason="end_turn"), "pending"),
+        (LLMResponse(text="APPROVE", stop_reason="max_tokens"), "pending"),
+        (LLMResponse(text="APPROVE", tool_calls=[call("modify_address")]), "pending"),
+        (None, "pending"),  # Empty mock script simulates a classifier exception.
     ],
 )
 def test_proposal_llm_confirmation_still_fails_closed(
-    shop: Services, classification: LLMResponse
+    shop: Services, classification: LLMResponse | None, status: str
 ) -> None:
     request = address_action(shop)
-    classifier = MockLLM([classification])
+    classifier = MockLLM([classification] if classification is not None else [])
     agent, session, _ = setup_agent(
         shop,
         [
@@ -1045,11 +1116,102 @@ def test_proposal_llm_confirmation_still_fails_closed(
         classifier=classifier,
     )
     agent.respond(session, "改址")
+    assert not classifier.requests
     agent.respond(session, "确认")
     assert len(classifier.requests) == 1
-    assert results(session)[-1].is_error == (
-        classification.text != "YES" or classification.stop_reason != "end_turn"
+    assert session.proposals[-1].status == status
+    assert results(session)[-1].is_error == (status != "consumed")
+
+
+def test_semantic_confirmation_bypasses_heuristics_but_preserves_exact_binding(
+    shop: Services, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import aftersales.policy.proposal as proposals
+
+    def forbidden(*args: Any) -> bool:
+        raise AssertionError("legacy matcher invoked for semantic mode")
+
+    for name in ("presentation_matches", "whole_plan_acknowledgment", "changes_plan"):
+        monkeypatch.setattr(proposals, name, forbidden)
+    request = address_action(shop)
+    mismatched = address_action(shop)
+    mismatched["arguments"]["address"]["detail"] = "未获批准的地址"
+    classifier = MockLLM([LLMResponse(text="APPROVE")])
+    agent, session, _ = setup_agent(
+        shop,
+        [
+            propose(request),
+            LLMResponse(text="O1006 改址，原单商品合计 ¥400.00，请确认。"),
+            using(as_call(mismatched), as_call(request)),
+            LLMResponse(text="改址完成。"),
+        ],
+        config=AgentConfig(proposal_gate=True, confirm_mode="llm"),
+        classifier=classifier,
     )
+    offer = agent.respond(session, "请改址").reply
+    assert offer.endswith(format_proposal_summary(session.proposals[-1]))
+    agent.respond(session, "好的，请按方案 P0001 v1 修改。不取消其他订单。")
+    payload = json.loads(classifier.requests[0].messages[0].content)
+    assert payload["助手上一条完整回复"] == offer
+    assert "P0001 v1" in payload["买家当前消息"] and "P0001" in payload["服务端方案卡"]
+    assert classifier.requests[0].temperature == 0.0 and not classifier.requests[0].tools
+    assert "P02" in results(session)[-2].content
+    assert not results(session)[-1].is_error and session.proposals[-1].status == "consumed"
+    assert shop.get_order("O1006").address.detail == request["arguments"]["address"]["detail"]
+
+
+def test_semantic_neutral_holds_residual_writes_and_rejection_revokes_them(shop: Services) -> None:
+    # Price refund would be (13000-10000)*2*24700/26000 = 5700 cents.
+    address = address_action(shop)
+    price = action("apply_price_protection", order_id="O1006", order_item_id="OI00006")
+    classifier = MockLLM([LLMResponse(text=v) for v in ("APPROVE", "NEUTRAL", "REJECT")])
+    agent, session, _ = setup_agent(
+        shop,
+        [
+            propose(address, price),
+            LLMResponse(text="改址并退差 ¥57.00，请确认。"),
+            using(as_call(address)),
+            LLMResponse(text="已改址，价保尚未办理。"),
+            using(as_call(price)),
+            LLMResponse(text="这是试算说明。"),
+            using(as_call(price)),
+            LLMResponse(text="已撤销。"),
+        ],
+        config=AgentConfig(proposal_gate=True, confirm_mode="llm"),
+        classifier=classifier,
+    )
+    agent.respond(session, "改址和价保")
+    agent.respond(session, "两项都照办")
+    agent.respond(session, "差价怎么算？")
+    plan = session.proposals[-1]
+    assert plan.status == "approved" and results(session)[-1].is_error
+    agent.respond(session, "价保先别办")
+    assert plan.status == "rejected" and len(classifier.requests) == 3
+    assert results(session)[-1].is_error and shop.refunded_cents("O1006") == 0
+
+
+@pytest.mark.parametrize("tamper", ["version", "card"])
+def test_semantic_confirmation_requires_the_latest_server_card(shop: Services, tamper: str) -> None:
+    request = address_action(shop)
+    classifier = MockLLM([LLMResponse(text="APPROVE")])
+    agent, session, _ = setup_agent(
+        shop,
+        [
+            propose(request),
+            LLMResponse(text="请确认。"),
+            using(as_call(request)),
+            LLMResponse(text="仍未执行。"),
+        ],
+        config=AgentConfig(proposal_gate=True, confirm_mode="llm"),
+        classifier=classifier,
+    )
+    agent.respond(session, "改址")
+    if tamper == "version":
+        session.presented_proposal_version += 1
+    else:
+        session.messages[-1].content = "只有模型正文，没有服务端卡片。"
+    agent.respond(session, "确认")
+    assert not classifier.requests and results(session)[-1].is_error
 
 
 @pytest.mark.parametrize(
@@ -1072,6 +1234,113 @@ def test_whole_plan_confirmation_accepts_simple_and_safe_boundary_phrases(
     agent.respond(session, "改址")
     agent.respond(session, text)
     assert session.proposals[0].status == "consumed" and not results(session)[-1].is_error
+
+
+@pytest.mark.parametrize(
+    "text,compound,accepted",
+    [
+        ("好的，请帮我办理", True, True),
+        ("没问题，确认改地址并退差价", True, True),
+        ("好的，确认，请按上述地址修改，谢谢。", False, True),
+        ("好的，确认，请按上述方案修改地址，不办理其他操作。", False, True),
+        ("好的，确认，请按此方案办理改地址。", False, True),
+        ("确认，请执行本次修改。", False, True),
+        ("没问题，确认改地址", True, False),
+        ("确认，请按上述地址修改，谢谢。", True, False),
+        ("好的，确认改地址并取消订单", True, False),
+        ("确认改地址或退差价", True, False),
+        ("确认改地址并退差价，货到才办", True, False),
+        ("好的，请帮我办理并送赠品", True, False),
+        ("确认，请帮别人办理", False, False),
+        ("确认改地址？", False, False),
+        ("确认改地址到99号", False, False),
+    ],
+)
+def test_natural_buyer_confirmation_binds_the_entire_plan(
+    shop: Services, text: str, compound: bool, accepted: bool
+) -> None:
+    # O1006: (13000 - 10000) * 2 * 24700 / 26000 = 5700 cents.
+    actions = [address_action(shop)]
+    if compound:
+        actions.append(action("apply_price_protection", order_id="O1006", order_item_id="OI00006"))
+    reply = (
+        "O1006 改址并退差 ¥57.00，请确认。" if compound else "O1006 改址，涉及金额：¥0.00，请确认。"
+    )
+    agent, session, _ = setup_agent(
+        shop,
+        [
+            propose(*actions),
+            LLMResponse(text=reply),
+            using(*(as_call(a) for a in actions)),
+            LLMResponse(text="办理结果"),
+        ],
+    )
+    agent.respond(session, "请提供方案")
+    before = dump_hashes(shop.db)
+    agent.respond(session, text)
+    assert [m.is_error for m in results(session)[1:]] == [not accepted] * len(actions)
+    assert (dump_hashes(shop.db) != before) == accepted
+    assert (session.proposals[-1].status == "consumed") == accepted
+
+
+def test_named_action_restatements_must_identify_every_instance(shop: Services) -> None:
+    # Both actions are address edits, with no monetary effect.
+    shop.db.execute("UPDATE orders SET user_id='U006', payment_method_id='PM0006' WHERE id='O1009'")
+    actions = [address_action(shop, order) for order in ("O1006", "O1009")]
+    agent, session, _ = setup_agent(shop, [propose(*actions), LLMResponse(text="请确认改址。")])
+    agent.respond(session, "修改两单地址")
+    plan = session.proposals[-1]
+    assert whole_plan_acknowledgment("确认改地址 O1006 并改地址 O1009", plan)
+    assert not whole_plan_acknowledgment("确认改地址", plan)
+    assert not whole_plan_acknowledgment("确认改地址 O1006 并改地址 O1006", plan)
+    assert not whole_plan_acknowledgment("确认改地址 O1006 并改地址 O1008", plan)
+
+
+def test_partial_restatement_revokes_unused_action(shop: Services) -> None:
+    # The unspent price action would refund (13000 - 10000) * 2 * 24700 / 26000 = 5700 cents.
+    addr = address_action(shop)
+    price = action("apply_price_protection", order_id="O1006", order_item_id="OI00006")
+    agent, session, _ = setup_agent(
+        shop,
+        [
+            propose(addr, price),
+            LLMResponse(text="改址并退差 ¥57.00，请确认。"),
+            using(as_call(addr)),
+            LLMResponse(text="已改址。"),
+            using(as_call(price)),
+            LLMResponse(text="需要重新提案。"),
+        ],
+    )
+    agent.respond(session, "改址并价保")
+    agent.respond(session, "好的，请帮我办理")
+    assert session.proposals[-1].status == "approved"
+    agent.respond(session, "确认改地址")
+    assert session.proposals[-1].status == "rejected"
+    assert results(session)[-1].is_error and shop.refunded_cents("O1006") == 0
+
+
+@pytest.mark.parametrize(
+    "reply,accepted",
+    [("确认取消 O1009。", True), ("确认取消 O1006。", False), ("好的，确认下单，请办理。", False)],
+)
+def test_p7_buyer_confirmation_is_scoped_to_the_current_step(
+    shop: Services, reply: str, accepted: bool
+) -> None:
+    # P7 t042: cancelling the unpaid order refunds zero cents.
+    cancel = action("cancel_order", order_id="O1009", reason="临时不需要")
+    agent, session, _ = setup_agent(
+        shop,
+        [
+            propose(cancel),
+            LLMResponse(text="请确认取消 O1009。"),
+            using(as_call(cancel)),
+            LLMResponse(text="本轮结束。"),
+        ],
+        user="U009",
+    )
+    agent.respond(session, "请说明第一步")
+    agent.respond(session, reply)
+    assert (shop.get_order("O1009").status == "cancelled") == accepted
 
 
 def test_existing_eval_task_supports_proposal_consent_and_split_execution(tmp_path: Path) -> None:

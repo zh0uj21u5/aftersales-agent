@@ -123,6 +123,8 @@ class AuditHooks(Hooks):
                 **record.model_dump(mode="json"),
             )
 
-    def on_turn_end(self, session: Session, result: TurnResult) -> None:
-        self.inner.on_turn_end(session, result)
+    def on_turn_end(
+        self, session: Session, result: TurnResult, *, config: AgentConfig | None = None
+    ) -> None:
+        self.inner.on_turn_end(session, result, config=config)
         self.confirmation.on_turn_end(self.shadow, result)

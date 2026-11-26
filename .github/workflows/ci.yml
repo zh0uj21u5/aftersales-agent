@@ -40,3 +40,37 @@ jobs:
       - name: Run offline end-to-end demo script
         run: |
           python scripts/demo.py
+
+      - name: Smoke test the installed wheel outside the checkout
+        shell: bash
+        run: |
+          work=$(mktemp -d)
+          python -m pip wheel --no-deps --wheel-dir "$work/dist" .
+          cd "$work"
+          unset PYTHONPATH
+          python -m venv venv
+          source venv/bin/activate
+          python -m pip install dist/*.whl
+          aftersales --help
+          aftersales seed
+          mkdir -p evals/reports
+          python -I - <<'PY'
+          from pathlib import Path
+          import sys
+          from fastapi.testclient import TestClient
+          from aftersales.core.llm import MockLLM
+          from aftersales.web import app
+
+          assert Path(app.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
+          assert not list(Path("evals/reports").iterdir())
+          expected = {"2ed0fe45f340406e88d759f48c7600bd", "3b583330d28a465fb6c07448abef00dd"}
+          with TestClient(app.create_app("data/shop.db", MockLLM([]))) as client:
+              listing = client.get("/api/evals/reports")
+              listing.raise_for_status()
+              assert {entry["run_id"] for entry in listing.json()} == expected
+              for run_id in expected:
+                  response = client.get(f"/api/evals/reports/{run_id}")
+                  response.raise_for_status()
+                  report = response.json()
+                  assert report["run_id"] == run_id and len(report["trials"]) == 8
+          PY

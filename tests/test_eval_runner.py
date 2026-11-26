@@ -30,6 +30,36 @@ def auth(task: EvalTask) -> LLMResponse:
     return call("find_user_by_phone", phone=task.user_profile.phone, name=task.user_profile.name)
 
 
+def test_semantic_confirmation_usage_is_part_of_agent_cost(tmp_path: Path) -> None:
+    task = next(t for t in TASKS if t.id.startswith("t001_"))
+    (address,) = task.gold_actions
+    model = MockLLM(
+        [
+            auth(task),
+            call(
+                "propose_actions", actions=[{"tool_name": address.tool, "arguments": address.args}]
+            ),
+            LLMResponse(text="请确认改地址。"),
+            LLMResponse(text="APPROVE", usage=Usage(input_tokens=100, output_tokens=10)),
+            call(address.tool, **address.args),
+            LLMResponse(text="地址已修改。"),
+        ]
+    )
+    simulator = MockLLM(
+        [LLMResponse(text="确认按方案 P0001 v1 办理"), LLMResponse(text="###STOP###")]
+    )
+    config = AgentConfig(model="deepseek-v4.1-flash", proposal_gate=True, confirm_mode="llm")
+    trial = run_trial(
+        task, model, config, trace_dir=tmp_path, user_mode="llm", simulator_llm=simulator
+    )
+    assert trial.grade.passed
+    assert trial.usage == Usage(input_tokens=100, output_tokens=10)
+    assert trial.agent_cost_usd == "0.000042" and trial.simulator_usage == Usage()
+    events = read_trace(tmp_path / f"{trial.trace_id}.jsonl")
+    assert [e.data["verdict"] for e in events if e.event == "proposal_confirmation"] == ["APPROVE"]
+    assert sum(e.event == "llm_call" and e.data["purpose"] == "confirmation" for e in events) == 1
+
+
 def oracle_script(task: EvalTask) -> list[LLMResponse]:
     script = [auth(task)]
     if any(
@@ -220,9 +250,11 @@ def test_trial_cache_isolation_and_report_metrics(tmp_path: Path) -> None:
         "report_dir": tmp_path / "reports",
         "trace_dir": tmp_path / "traces",
         "cache_dir": tmp_path / "cache",
+        "workers": 2,
     }
     report = run_suite([task], mock, config, **kwargs)
     assert len(mock.requests) == 2 and report.metrics["cache_hits"] == 0
+    assert [trial.trial for trial in report.trials] == [0, 1]
     # 200 input * .30 + 40 output * 1.20 per million = .000108 USD.
     assert report.metrics["cost_usd"] == "0.000108"
     assert report.metrics["pass^2"] == 1

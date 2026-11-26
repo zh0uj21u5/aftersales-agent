@@ -14,7 +14,12 @@ from aftersales.core.hooks import Deny, Hooks
 from aftersales.core.llm import LLMClient, Message, ToolCall, Usage
 from aftersales.core.session_store import SessionStore
 from aftersales.core.tracing import TraceWriter
-from aftersales.policy.proposal import ActionProposal, expire_identity
+from aftersales.policy.proposal import (
+    ActionProposal,
+    expire_identity,
+    format_proposal_summary,
+    latest_proposal,
+)
 from aftersales.tools.registry import ToolContext, ToolRegistry, ToolResult, tool_result_message
 
 SYSTEM = (
@@ -113,11 +118,12 @@ class Agent:
         goal_checked = False
         goal_feedback = ""
 
-        def finish(
-            reply: str, reason: TurnStopReason, steps: int, *, append: bool = True
-        ) -> TurnResult:
-            if append:
-                session.messages.append(Message(role="assistant", content=reply))
+        def finish(reply: str, reason: TurnStopReason, steps: int) -> TurnResult:
+            if reason == "end_turn" and self.config.proposal_gate and self.config.confirm_gate:
+                proposal = latest_proposal(session)
+                if proposal and proposal.status == "pending":
+                    reply += "\n\n" + format_proposal_summary(proposal)
+            session.messages.append(Message(role="assistant", content=reply))
             result = TurnResult(
                 reply=reply,
                 stop_reason=reason,
@@ -125,7 +131,7 @@ class Agent:
                 usage=usage,
                 steps=steps,
             )
-            self.hooks.on_turn_end(session, result)
+            self.hooks.on_turn_end(session, result, config=self.config)
             session.persist()
             if self.trace:
                 self.trace.emit(
@@ -193,8 +199,7 @@ class Agent:
                         if verdict is not None and not verdict.complete:
                             goal_feedback = missing_feedback(verdict)
                             continue
-                    session.messages.append(Message(role="assistant", content=response.text))
-                    return finish(response.text, "end_turn", step, append=False)
+                    return finish(response.text, "end_turn", step)
                 return finish("模型未提供有效回答，请重试。", "error", step)
 
             session.messages.append(

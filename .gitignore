@@ -39,6 +39,7 @@ docs/M1_ACCEPTANCE.md
 docs/DECISIONS.md
 docs/RETROSPECTIVE.md
 docs/notes/
+docs/obsidian/
 scripts/analyze_p7.py
 scripts/analyze_m7.py
 evals/reports/*plan*.md

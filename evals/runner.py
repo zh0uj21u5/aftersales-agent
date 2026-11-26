@@ -6,6 +6,7 @@ import math
 import time
 from collections import Counter, defaultdict
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import Decimal
 from pathlib import Path
 from typing import Literal
@@ -439,12 +440,15 @@ def run_suite(
     user_mode: Literal["scripted", "llm"] = "scripted",
     simulator_llm: LLMClient | None = None,
     simulator_model: str | None = None,
+    workers: int = 1,
 ) -> EvalReport:
     n = k if n is None else n
     if not tasks or not 1 <= k <= n or user_mode not in {"scripted", "llm"}:
         raise ValueError("任务不能为空，且需要 1 <= k <= n")
     if len({task.id for task in tasks}) != len(tasks):
         raise ValueError("任务 ID 重复")
+    if workers < 1:
+        raise ValueError("workers 必须为正数")
     # Validate the entire selection before the first paid model call.
     for task in tasks:
         db = fresh_database(seed)
@@ -476,35 +480,53 @@ def run_suite(
             + (simulator_model or config.model)
         ).encode()
     ).hexdigest()
+
+    def execute(task: EvalTask, index: int) -> TrialResult:
+        client = (
+            CachedClient(llm, cache_dir / namespace / task.id / str(index)) if cache_dir else llm
+        )
+        simulator_client = (
+            CachedClient(
+                simulator_llm or llm, cache_dir / namespace / task.id / str(index) / "simulator"
+            )
+            if cache_dir
+            else simulator_llm or llm
+        )
+        return run_trial(
+            task,
+            client,
+            config,
+            trial=index,
+            seed=seed,
+            trace_dir=trace_dir,
+            user_mode=user_mode,
+            simulator_llm=simulator_client,
+            simulator_model=simulator_model,
+        )
+
     results = []
-    for task in tasks:
-        for index in range(n):
-            client = (
-                CachedClient(llm, cache_dir / namespace / task.id / str(index))
-                if cache_dir
-                else llm
-            )
-            simulator_client = (
-                CachedClient(
-                    simulator_llm or llm, cache_dir / namespace / task.id / str(index) / "simulator"
-                )
-                if cache_dir
-                else simulator_llm or llm
-            )
-            result = run_trial(
-                task,
-                client,
-                config,
-                trial=index,
-                seed=seed,
-                trace_dir=trace_dir,
-                user_mode=user_mode,
-                simulator_llm=simulator_client,
-                simulator_model=simulator_model,
-            )
-            results.append(result)
-            if progress:
-                progress(result)
+
+    def collect(result: TrialResult) -> None:
+        results.append(result)
+        if progress:
+            progress(result)
+
+    pairs = [(task, index) for task in tasks for index in range(n)]
+    if workers == 1:
+        for task, index in pairs:
+            collect(execute(task, index))
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            pending = {pool.submit(execute, task, index) for task, index in pairs}
+            try:
+                for future in as_completed(pending):
+                    collect(future.result())
+            except BaseException:
+                for future in pending:
+                    future.cancel()
+                raise
+        order = {task.id: i for i, task in enumerate(tasks)}
+        results.sort(key=lambda result: (order[result.task_id], result.trial))
     metrics, taxonomy = aggregate(results, k)
     report = EvalReport(
         run_id=uuid4().hex,

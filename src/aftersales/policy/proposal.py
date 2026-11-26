@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import Callable
-from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from aftersales.domain.models import CheckResult, Violation
+from aftersales.domain.models import ApprovalRequest, CheckResult, Violation
 from aftersales.domain.services import PolicyError
+from aftersales.policy.proposal_text import (
+    changes_plan,
+    format_proposal_summary,  # noqa: F401 - public proposal renderer
+    presentation_matches,
+    whole_plan_acknowledgment,
+)
 
 if TYPE_CHECKING:
     from aftersales.tools.registry import SessionState, ToolContext
@@ -23,9 +27,6 @@ WriteToolName = Literal[
     "request_exchange",
     "create_order",
 ]
-
-_MONEY_NUMBER = r"[+\-−]?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|\.\d+)"
-_MONEY = re.compile(rf"([+\-−])?[¥￥]\s*({_MONEY_NUMBER})|({_MONEY_NUMBER})\s*元")
 
 
 class ActionRequest(BaseModel):
@@ -41,8 +42,19 @@ class ProposedAction(BaseModel):
     canonical_args: dict[str, Any]
     preview_amount_cents: int | None
     requires_approval: bool
+    refund_account_label: str | None = None
     preconditions: dict[str, Any]
     status: Literal["pending", "approved", "executed", "invalidated"] = "pending"
+
+    @property
+    def amount_label(self) -> str:
+        if self.tool_name == "create_order":
+            return "实付"
+        if self.tool_name == "request_exchange":
+            old_price = self.preconditions["items"][0]["unit_price_cents"]
+            if self.preconditions["target_sku"]["price_cents"] > old_price:
+                return "待补款"
+        return "退款"
 
 
 class ActionProposal(BaseModel):
@@ -55,27 +67,6 @@ class ActionProposal(BaseModel):
     confirm_source: Literal["natural_language", "web_button"] | None = None
     actions: list[ProposedAction] = Field(min_length=1)
     created_at: str
-
-
-def presentation_matches(reply: str, proposal: ActionProposal) -> bool:
-    """Check explicit order IDs and currency amounts against the server's proposal."""
-    order_ids = {action.canonical_args.get("order_id") for action in proposal.actions}
-    if not set(re.findall(r"O\d{4,}", reply)).issubset(order_ids):
-        return False
-    amounts = [
-        action.preview_amount_cents
-        for action in proposal.actions
-        if action.preview_amount_cents is not None
-    ]
-    allowed = {*amounts, sum(amounts)} if amounts else set()
-    for sign, prefixed, suffixed in _MONEY.findall(reply):
-        if sign and prefixed.startswith(("+", "-", "−")):
-            return False
-        value = (sign + prefixed if prefixed else suffixed).replace(",", "").replace("−", "-")
-        cents, denominator = Decimal(f"{value}e2").as_integer_ratio()
-        if denominator != 1 or cents not in allowed:
-            return False
-    return True
 
 
 class ProposalResult(BaseModel):
@@ -260,6 +251,18 @@ def create_proposal(ctx: ToolContext, actions: list[ActionRequest]) -> ProposalR
                 if request.tool_name == "modify_address"
                 else check.amount_cents,
                 requires_approval=check.needs_approval,
+                refund_account_label=next(
+                    (
+                        p.label
+                        for p in ctx.services()
+                        .get_user(session.authenticated_user_id)
+                        .payment_methods
+                        if p.id == snapshot["order"]["payment_method_id"]
+                    ),
+                    None,
+                )
+                if "payment_method_id" in snapshot.get("order", {})
+                else None,
                 preconditions=snapshot,
             )
         )
@@ -320,38 +323,49 @@ def decide_proposal(
     return proposal.model_copy(deep=True)
 
 
-def changes_plan(text: str, proposal: ActionProposal) -> bool:
-    from aftersales.core.hooks import has_veto
-
-    if has_veto(text):
-        return True
-    if any(a.tool_name == "cancel_order" for a in proposal.actions) and "不取消订单" in text:
-        return True
-    return bool(
-        re.search(
-            r"只(?:改|退|换|取消|执行|做|办理|要|申请|处理)|仅|部分|除外|排除|保留|暂|稍后|晚点|再说|"
-            r"先(?:改|退|换|取消|执行|做|办理)|如果|假如|若|只要|除非|前提|条件|但是|不过|但|"
-            r"改成|换成|改为|换为|改到|换到|修改|另一个|另一|加上|还要|顺便|地址[为是：:]|"
-            r"\b(?:only|except|if|unless|but|change|instead|also|add)\b",
-            text,
-            re.IGNORECASE,
+def retire_submitted_approval(
+    session: SessionState, order_id: str, request: ApprovalRequest
+) -> None:
+    """Remove only the P08 action covered by a successful approval submission."""
+    proposal = latest_proposal(session)
+    if proposal is None or proposal.status not in {"pending", "approved"}:
+        return
+    try:
+        args = validate_arguments(request.action, {**request.args, "order_id": order_id})
+    except ValueError:
+        return  # Services accepts arbitrary approval metadata; keep an unmatched plan intact.
+    submitted = business_arguments(args.model_dump(mode="json"))
+    matched = [
+        action
+        for action in proposal.actions
+        if action.requires_approval
+        and action.status in {"pending", "approved"}
+        and action.tool_name == request.action
+        and business_arguments(action.canonical_args) == submitted
+    ]
+    if not matched:
+        return
+    remaining = [
+        a for a in proposal.actions if a not in matched and a.status in {"pending", "approved"}
+    ]
+    if not any(not a.requires_approval for a in remaining):
+        invalidate(proposal, "superseded")
+    elif proposal.status == "pending":
+        version = proposal.version + 1
+        session.proposals.append(
+            proposal.model_copy(
+                update={
+                    "proposal_id": f"P{version:04}",
+                    "version": version,
+                    "actions": [a.model_copy(deep=True) for a in remaining],
+                }
+            )
         )
-    )
-
-
-def whole_plan_acknowledgment(text: str) -> bool:
-    """Fail closed on unrecognized additions instead of treating any embedded YES as consent."""
-    from aftersales.core.hooks import confirmation_text
-
-    text = re.sub(r"[\s，。；！、,.!;]+", "", confirmation_text(text)).lower()
-    return bool(
-        re.fullmatch(
-            r"(?:好的?|可以|我?确认|我?同意|是的|行|没问题|ok|yes|就这么办|就这样办|照办|"
-            r"按(?:照)?(?:上述|以上|当前|这份|整份|全部|原)?方案(?:全部)?(?:执行|办理)|"
-            r"(?:整份|全部|都)(?:同意|确认|执行|办理)|执行|办理|请|吧)+",
-            text,
-        )
-    )
+        invalidate(proposal, "superseded")
+    else:
+        for action in matched:
+            action.status = "invalidated"
+    session.presented_proposal_version = None
 
 
 def authorize_natural_language(session: SessionState, agrees: Callable[[], bool]) -> None:
@@ -363,7 +377,8 @@ def authorize_natural_language(session: SessionState, agrees: Callable[[], bool]
     if index < 0:
         return
     text = session.messages[index].content or ""
-    if changes_plan(text, proposal):
+    step = 1 + sum(p.status == "consumed" for p in session.proposals[:-1])
+    if changes_plan(text, proposal, step=step):
         proposal.confirm_source = "natural_language"
         invalidate(proposal, "rejected")
     elif (
@@ -371,7 +386,7 @@ def authorize_natural_language(session: SessionState, agrees: Callable[[], bool]
         and session.confirmation_proposal
         and session.presented_proposal_version == proposal.version
         and presentation_matches(session.confirmation_proposal, proposal)
-        and whole_plan_acknowledgment(text)
+        and whole_plan_acknowledgment(text, proposal, step=step)
         and agrees()
     ):
         decide_proposal(
@@ -449,5 +464,5 @@ def consume_action(session: SessionState, action: ProposedAction, *, success: bo
         invalidate(proposal, "expired")
         return
     action.status = "executed"
-    if all(item.status == "executed" for item in proposal.actions):
+    if all(item.status in {"executed", "invalidated"} for item in proposal.actions):
         proposal.status = "consumed"

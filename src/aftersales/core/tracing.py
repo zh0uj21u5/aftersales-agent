@@ -24,6 +24,7 @@ EventType = Literal[
     "tool_call",
     "guard_verdict",
     "confirm_verdict",
+    "proposal_confirmation",
     "tool_result",
     "goal_judge",
     "context_compaction",

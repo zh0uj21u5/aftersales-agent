@@ -8,6 +8,8 @@ import typer
 import yaml
 from pydantic import ValidationError
 from rich.console import Console
+from rich.panel import Panel
+from rich.text import Text
 
 from aftersales.core.config import AgentConfig, load_settings
 from aftersales.core.llm import make_client
@@ -18,6 +20,7 @@ from aftersales.core.tracing import TraceWriter, render_trace, trace_path
 from aftersales.domain.clock import FixedClock
 from aftersales.domain.db import connect
 from aftersales.domain.seed import seed_database
+from aftersales.policy.proposal import format_proposal_summary, latest_proposal
 
 app = typer.Typer(help="E-commerce after-sales agent.", no_args_is_help=True)
 
@@ -107,7 +110,16 @@ def chat(
             if not user_text.strip():
                 continue
             result = agent.respond(session, user_text)
-            console.print(f"售后管家：{result.reply}", markup=False)
+            proposal = latest_proposal(session)
+            card = (
+                format_proposal_summary(proposal)
+                if proposal and proposal.status == "pending"
+                else None
+            )
+            reply = result.reply.removesuffix("\n\n" + card) if card else result.reply
+            console.print(f"售后管家：{reply}", markup=False)
+            if card:
+                console.print(Panel(Text(card)))
             if session.closed:
                 reason = "handoff"
         console.print(
