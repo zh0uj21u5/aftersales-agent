@@ -188,7 +188,7 @@ def create_app(
     database = Path(db_path) if db_path is not None else None
     if production is None and (database is None or not database.is_file()):
         raise ValueError("数据库不存在，请先 seed")
-    options = config or AgentConfig(proposal_gate=True)
+    options = config or AgentConfig(proposal_gate=True, output_guard=production is not None)
     if not (options.guard and options.confirm_gate and options.proposal_gate):
         raise ValueError("本地确认卡 API 必须开启 guard、confirm_gate 与 proposal_gate")
     business_clock = clock or (WallClock() if production is not None else FixedClock())

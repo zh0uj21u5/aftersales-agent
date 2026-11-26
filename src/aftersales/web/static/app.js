@@ -108,7 +108,7 @@ async function streamMessage(sessionId, content) {
           result = data;
         } else if (event === "error") {
           failure = typeof data.message === "string" ? data.message : data.message.message;
-        } else if (["tool_call", "guard_verdict", "confirm_verdict", "tool_result", "proposal_created"].includes(event)) {
+        } else if (["tool_call", "guard_verdict", "confirm_verdict", "tool_result", "proposal_created", "output_guard"].includes(event)) {
           if (event === "tool_call") preview.textContent = "";
           liveEvents.push({event, data});
           audit();

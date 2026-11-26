@@ -27,6 +27,13 @@ from aftersales.core.session_store import SessionStore, StoreRunner
 from aftersales.core.tracing import TraceEvent, TraceSink
 from aftersales.domain.db import transaction
 from aftersales.policy.confirmation import LEGACY_CONFIRMATION_FIELDS, ConfirmationState
+from aftersales.policy.output_guard import (
+    OutputVerdict,
+    TurnToolOutcome,
+    check_output,
+    output_feedback,
+    safe_fallback_reply,
+)
 from aftersales.policy.proposal import (
     ActionProposal,
     expire_identity,
@@ -128,6 +135,7 @@ StreamEventType = Literal[
     "confirm_verdict",
     "tool_result",
     "proposal_created",
+    "output_guard",
     "turn_end",
     "error",
 ]
@@ -137,6 +145,7 @@ _STREAM_TRACE_EVENTS = {
     "confirm_verdict",
     "tool_result",
     "proposal_created",
+    "output_guard",
 }
 
 
@@ -280,9 +289,13 @@ class AsyncAgent:
         recovery = ""
         goal_checked = False
         goal_feedback = ""
+        turn_outcomes: list[TurnToolOutcome] = []
+        retry_verdict: OutputVerdict | None = None
 
-        def tool_event(
-            event: Literal["tool_call", "tool_result", "proposal_created", "guard_verdict"],
+        def stream_trace_event(
+            event: Literal[
+                "tool_call", "tool_result", "proposal_created", "guard_verdict", "output_guard"
+            ],
             **data: JsonValue,
         ) -> None:
             if self.trace is not None:
@@ -329,6 +342,28 @@ class AsyncAgent:
                     )
                 )
 
+        def output_event(
+            verdict: OutputVerdict, status: Literal["passed", "retry", "fallback"], step: int
+        ) -> None:
+            details = {"reason": "；".join(issue.reason for issue in verdict.issues)}
+            stream_trace_event(
+                "output_guard",
+                enabled=True,
+                allowed=verdict.allowed,
+                status=status,
+                codes=[issue.code for issue in verdict.issues],
+                turn_id=turn_id,
+                step=step,
+                **(details if verdict.issues else {}),
+            )
+
+        async def output_fallback(
+            verdict: OutputVerdict, had_preview: bool, step: int
+        ) -> TurnResult:
+            discard_preview(had_preview)
+            output_event(verdict, "fallback", step)
+            return await finish(safe_fallback_reply(turn_outcomes), "end_turn", step)
+
         for step in range(1, self.config.max_steps + 1):
             self.hooks.before_llm(session)
             system = with_proposal_contract(
@@ -373,11 +408,21 @@ class AsyncAgent:
                     on_delta=delta if send is not None else None,
                 )
             except InferenceUnavailable as exc:
+                if retry_verdict is not None:
+                    return await output_fallback(retry_verdict, not first_delta, step)
                 return await finish(str(exc), "error", step)
             except Exception:  # noqa: BLE001 - isolate third-party client failures
+                if retry_verdict is not None:
+                    return await output_fallback(retry_verdict, not first_delta, step)
                 return await finish("模型调用失败，请稍后重试。", "error", step)
             usage.add(response.usage)
             self.hooks.after_llm(session, response)
+            if retry_verdict is not None and (
+                response.stop_reason != "end_turn"
+                or response.tool_calls
+                or not (response.text and response.text.strip())
+            ):
+                return await output_fallback(retry_verdict, not first_delta, step)
             if response.stop_reason == "error":
                 return await finish("模型响应异常，本次无法继续处理。", "error", step)
             truncated = response.stop_reason == "max_tokens"
@@ -404,6 +449,18 @@ class AsyncAgent:
                             discard_preview(not first_delta)
                             goal_feedback = missing_feedback(verdict)
                             continue
+                    if self.config.output_guard:
+                        compliance = check_output(response.text, turn_outcomes)
+                        if compliance.allowed:
+                            output_event(compliance, "passed", step)
+                        elif retry_verdict is not None or step == self.config.max_steps:
+                            return await output_fallback(compliance, not first_delta, step)
+                        else:
+                            discard_preview(not first_delta)
+                            output_event(compliance, "retry", step)
+                            retry_verdict = compliance
+                            recovery = output_feedback(compliance)
+                            continue
                     return await finish(response.text, "end_turn", step)
                 return await finish("模型未提供有效回答，请重试。", "error", step)
 
@@ -428,7 +485,7 @@ class AsyncAgent:
                 execution_id = f"{turn_id}:{len(calls)}"
                 entry = self.registry.get(call.name)
                 permission = entry.spec.permission if entry else None
-                tool_event(
+                stream_trace_event(
                     "tool_call",
                     **call.model_dump(mode="json"),
                     execution_id=execution_id,
@@ -485,7 +542,7 @@ class AsyncAgent:
                             session.closed = handed_off = True
                     self.hooks.after_tool(ctx, call, result)
                     if result.source == "service" and result.rule_ids:
-                        tool_event(
+                        stream_trace_event(
                             "guard_verdict",
                             execution_id=execution_id,
                             call_id=call.id,
@@ -502,7 +559,9 @@ class AsyncAgent:
                     return previous_proposals, result
 
                 previous_proposals, result = await scope(execute, write=True)
-                tool_event(
+                if result.outcome is not None:
+                    turn_outcomes.append(result.outcome)
+                stream_trace_event(
                     "tool_result",
                     execution_id=execution_id,
                     call_id=call.id,
@@ -511,7 +570,7 @@ class AsyncAgent:
                     **result.model_dump(mode="json"),
                 )
                 if len(session.proposals) > previous_proposals:
-                    tool_event(
+                    stream_trace_event(
                         "proposal_created", proposal=session.proposals[-1].model_dump(mode="json")
                     )
             if handed_off:

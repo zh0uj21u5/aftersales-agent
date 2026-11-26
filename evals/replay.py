@@ -14,6 +14,7 @@ from aftersales.domain.models import (
 from aftersales.domain.seed import seed_data
 from aftersales.domain.services import Services
 from evals.models import EvalTask, GoldAction
+from evals.world import apply_world_event
 
 
 def fresh_database(seed: int = 42, clock: Clock | None = None) -> sqlite3.Connection:
@@ -45,6 +46,8 @@ def replay_action(service: Services, action: GoldAction) -> OperationResult | st
 
 
 def replay_gold(service: Services, task: EvalTask) -> list[OperationResult | str]:
+    for event in sorted(task.world_events, key=lambda event: event.after_turn):
+        apply_world_event(service.db, service.clock, event)
     return [replay_action(service, action) for action in task.gold_actions]
 
 

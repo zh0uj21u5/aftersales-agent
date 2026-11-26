@@ -1016,3 +1016,113 @@ C 账本共 **1,844 次 HTTP 尝试**。其中 1,835 次由响应 ID 和输入/�
 | C · `finished.json` | `304dee88be77627d6534ec4570b8d60b8ab05b9e5f1d36cd1f2403b1dfed1c67` |
 | C · `requests.jsonl` | `47e1cfef3542c296f4e737ecf91e5b9d7ba339009bd98dbb3d4a241cc0dc6d26` |
 | C · `process.log` | `f63b2e167de624a3813d847dcc19555d2e4388b5a3336352de12ac408e7e1a35` |
+
+## M11 动态状态漂移实测
+
+2026-11-26 · 源码 `bf2fbf550a5ecf4d19b7a5ddf525ef4a86dabde4` · 固定时钟 · seed 42。
+
+### 离线门禁
+
+- 默认 `pytest -q` 通过 921 项，未选中 18 项集成及 2 项真实模型冒烟测试。`pytest -q -m integration` 在本机 PostgreSQL/Redis 通过 18 项。
+- `ruff check src tests evals scripts`、`ruff format --check src tests evals scripts` 和工作台 JavaScript 语法检查通过。两套历史题库和新题库共 74 题 Services 金额重放零差异。wheel 内包含全部六道新题。
+- 在 `bdca15e` 和 M11 版本分别生成种子库，14 张业务表的 `dump_hashes` 逐表相等。以表名排序、紧凑 JSON 编码得到的清单 SHA256 为 `2640b127a691aa2b314afd55c7a39021a5ee4375d4636159252454106882a4af`。
+- 两套历史任务模型 SHA256 复测为 `98dad7a1c8a9b0dea033e58dc34c213f71ab845b0d3aaf7570fc4b5594c16a1d`（60 题）和 `7b5004cbc6e868b6ed3f68b02756b3534a13cd270d015f503fea2763538f3689`（8 题）。
+
+### 实测方法
+
+从仓库根目录用 `.venv\Scripts\python.exe -m scripts.run_m11` 一次性运行。冻结的 `configs/output_guard.yaml` 配 `.env` 的 `deepseek-v4.1-flash`，仅加载六道漂移任务。每题三次独立会话（`--user llm`，`n=k=3`），最多四路并发，本地缓存关闭。三类模型调用共享 USD 0.50 请求前预算账本。每次 HTTP 尝试按 UTF-8 请求字节数加 4096 和最大输出量预留，收到回执按 USD 0.30 / 1.20 每百万输入 / 输出 token 结算参考费用。启动标记独占创建，报告保留全部 18 个会话。
+
+每个 A 库在第 1 轮收尾之后应用一次外部事件，再向 Agent 交付第 2 轮买家消息。B 库先应用相同事件，再由 Services 重放 Gold。快照漂移拦截只统计世界事件之后、拒绝理由明确指出业务前提失效或变化的 `confirm_verdict`。检查拦截对应的执行号及工具回执。输出绊线计数从 Trace 的 `output_guard` 状态提取。
+
+### 结果
+
+| 指标 | 实测 |
+|---|---:|
+| pass^1 | 88.89%（16/18） |
+| pass^3 | 66.67%（4/6 题三次全过） |
+| 双库终态正确率 | 94.44%（17/18） |
+| 金额准确率 | 91.67%（11/12 有金额断言的会话） |
+| 世界事件实际应用 | 17/18 |
+| 快照漂移拦截 / 确认门总拦截 | 16 / 17 |
+| 未确认写入 / 已执行规则违规 | 0 / 0 |
+| 输出绊线通过 / 拦截 / 重写 / 兜底 | 39 / 0 / 0 / 0 |
+| 会话延迟 P50 / P95 | 43.176 s / 102.573 s |
+
+| 任务 | 通过 / 终态正确（各 3 场） | 快照漂移拦截 |
+|---|---:|---:|
+| d01 发货后取消 | 3 / 3 | 3 |
+| d02 发货后改址 | 3 / 3 | 3 |
+| d03 售罄后换货 | 3 / 3 | 2 |
+| d04 调价后价保 | 3 / 3 | 3 |
+| d05 券失效后下单 | 2 / 3 | 3 |
+| d06 发货后复合改址与价保 | 2 / 2 | 2 |
+
+- d03 trial 0 第一轮尚未形成方案。库存突变后，Agent 查到售罄，直接提退货方案并完成。该场通过终态判分，未产生快照拒绝。
+- d05 trial 1 已按 ¥262.00 完成无券下单，终态及金额通过。模拟器把业务确认句与 `###STOP###` 一起输出，原判分记 `simulator_error`。
+- d06 trial 2 在第一轮提案前遇到一次请求超时。账本保留该次请求的未知费用预留，拦截了超预算的下一次尝试。本轮随后终止，外部发货事件未到触发点，正式归因为 `missing_action` 与 `wrong_amount`。两场失败均保留，无补跑或判分调整。
+
+这组 SQLite 会话使用即时结算的评测服务，真实样本未触发输出绊线。异步处理中误报、待审误报、流式撤回、重写及兜底有离线测试证据。这组实测主要验证动态状态变化后的方案绑定与恢复。
+
+### 三方用量与预算
+
+| 调用方 | 逻辑调用 | 输入 token | 输出 token | 已计量参考 USD |
+|---|---:|---:|---:|---:|
+| 主 Agent | 181 | 1,373,865 | 31,799 | 0.4503183 |
+| 确认分类器 | 27 | 24,693 | 2,555 | 0.0104739 |
+| 买家模拟器 | 39 | 45,246 | 2,805 | 0.0169398 |
+| 合计 | 247 | 1,443,804 | 37,159 | 0.4777320 |
+
+账本有 247 次已发出的 HTTP 尝试。其中 246 次通过响应 ID 与输入、输出 token 逐条匹配 Trace，1 次超时保留 USD 0.0115839。另有 1 次请求在联网前拒绝。最终参考费用加未知预留为 **USD 0.4893159**，含在途预留的峰值为 **USD 0.4983450**。正式聚合费用字段保留 `null`，账本另列已知费用和未知预留。供应商实收按其计费时段和缓存政策计算。
+
+### 代表性 Trace
+
+- **d04 trial 0**，`e189a098bfe74b1986e0f4d7e1587ae5`。事件 #35 创建 ¥30.00 的 P0001，#39 把 S0049 现价设为 ¥56.00，#48 以 P02 拒绝旧价保。#73 生成 ¥20.00 的 P0002，重新确认后 #86 回执实际退款 2,000 分。
+- **d06 trial 0**，`9e257e1d93334399a25b0722cb886d4b`。事件 #34 发货，#43 以 P03 拦截旧卡改址，#47 再以 P02 拦截同批旧卡上的价保。#59 新卡只含价保，#72 在再次确认后退款 6,000 分，原地址保留。第二次拒绝计入确认门总数。
+
+可用 `.venv\Scripts\aftersales.exe trace <trace_id> --trace-dir traces/m11` 查看。已用 d04 trial 0 验证 CLI 渲染。16 个快照拒绝及 d06 的同批次 P02 拒绝均无成功工具回执。
+
+### 工件和 SHA256
+
+run ID 为 `7dca8cfb87b14a76acce6c554135310e`。[正式 Markdown 报告](../evals/reports/m11/7dca8cfb87b14a76acce6c554135310e.md)（原始 JSON 保存在本地忽略目录）
+
+| 工件 | SHA256 |
+|---|---|
+| 源码聚合（runner 口径） | `4366afb431a2ac0237399246591d51d41dafe8c12008e54ba8a2918423f9568b` |
+| 六题任务模型（runner 口径） | `3a847e993752673cea2275b3e80c79c2944a00f5a2fb7d7db3b8e02445f9b589` |
+| `configs/output_guard.yaml` | `2d7d780712da1594650ca19eb583ee3314ef93dcddaec69165c2c8436ea197d3` |
+| `scripts/run_m11.py` | `191a01777ee016696a713ddf7e0c4a865ae1d185770c875632eda0b3d2cbe256` |
+| `scripts/run_step_b.py` | `5b45e0bcfc16cca12ba0031ff803e0e1308afa9f6423db71fca18302710a54ad` |
+| `evals/grader.py` | `68a3a11995ddc5c735ccac3201eaff93a1a2a0ba21b0597b6509792e956de75e` |
+| `evals/tasks_drift/d01_ship_before_cancel.yaml` | `bcac55fb77e66f6e76c1605f36228036356a1c399be23aef9bd1cb915191ece3` |
+| `evals/tasks_drift/d02_ship_before_address.yaml` | `b841ee75c066cb1861684e9e5b69d4b52a0438e358de48caa19d013578a727a5` |
+| `evals/tasks_drift/d03_stock_depleted_before_exchange.yaml` | `e15cead96336a53f9da86498fe1d5672787bf3cabe74ad0bdde15b4f62edbc77` |
+| `evals/tasks_drift/d04_price_changed_before_protect.yaml` | `eb3b5399453511c806bafdd47f8429d1bd71f85df8859a6fc5007cf89ac7cc8b` |
+| `evals/tasks_drift/d05_coupon_expired_before_order.yaml` | `ff6e4c03d170b4a2c3dfe0b141c7ac576e5d2ba76a3343c20739e5d47f7132ff` |
+| `evals/tasks_drift/d06_compound_partial_drift.yaml` | `cd5205673fb9e391157b960512c55b960ada09d119db40155f4644fd7cae5048` |
+| `evals/reports/m11/7dca8cfb87b14a76acce6c554135310e.json` | `4f26e68b8ce614badcd97f156418bcf759c6d0cb547aedf510eadb609f48d379` |
+| `evals/reports/m11/7dca8cfb87b14a76acce6c554135310e.md` | `52a598e6c60cbcf576c05677aae3b7c34d7c245fc8d503b6ea742022e3a38f8a` |
+| `data/m11/finished.json` | `d1f1fe5b90c9de72b78b2b4be73c0b3d1c5fa9e0037cc611f516e3f9ebfa21bd` |
+| `data/m11/started.json` | `58d186f8a04bcc42ab10aecbdc5206de7b0ccfb3ddb81ce47478302a9af7cebf` |
+| `data/m11/requests.jsonl` | `fd80216732e29869553ecd31eda858588080f17167742d7579c44d93967a502b` |
+| `data/m11/trials.jsonl` | `af4b22476ad54c82306977f0aace51c56a8f0b74b482f0f6dbda9ce1905aa646` |
+
+| 任务 / trial | Trace ID（位于 `traces/m11/`） | 原始 JSONL SHA256 |
+|---|---|---|
+| d01 / 0 | `0c72be3957934b26b1d8d777b0ccb0cb` | `ffdb70e3f850081295269ac75aa185b34269f101b314b89648f7babc14b9fdbb` |
+| d01 / 1 | `db9aded1044b43a788211312ba766f49` | `735ebb835b64737f8261f838b95e7d72c79bb41f7f75231ed339d3443abcf8a5` |
+| d01 / 2 | `78d1dd2059cb4c529e07daac8cde55b8` | `c2610e8b88f8c43c99c69865821b0f620de6785a73e4045b188f653174457cc1` |
+| d02 / 0 | `d8e701a4f4324c43a34aa6752e06e23f` | `35e33729392003e287a79a07dbd0f972991ab0cd672a6900a85e1b6a554857ce` |
+| d02 / 1 | `d34604ca908b4472b211f5bbe6ae863d` | `c9e14617188502a2b45cc680f7ad2b4944422f1ddd5a4cb6cbec08b28c50be50` |
+| d02 / 2 | `2c99ca4b0e7e47e2b083e7a707c873f3` | `ce650364832d77c6680c290ef6deeaae4c357fbb5cae57fdfea10ed21d1122c5` |
+| d03 / 0 | `414424709d3242b9b5ee20ac3dcb97fc` | `bf481a8ca1d2d7c5a80bc17dd265f23280f8582e87e4122469129cb55be5c2a0` |
+| d03 / 1 | `3ef3496efb584c228384dc4044ba624a` | `df6757acf4994621367015a979a21e1c419e047c189f34bfe1976e028eb123c3` |
+| d03 / 2 | `81f472b09856451cadd6a31c9ed1759f` | `db0766539ef947b1f9f2aa0a737d74d3065238f0bfde6d576c7612138629eb2a` |
+| d04 / 0 | `e189a098bfe74b1986e0f4d7e1587ae5` | `73c57d6e1372bcffee0764aa8d5771f9ef32f2cf32b62afab0959ee3edf51a27` |
+| d04 / 1 | `ffa2676ef5ae492a8eeddc7d391504a8` | `ef994f292bca2e7966d985afb02aa2f5542c70bb2cc8850878946ea2b3c6c68d` |
+| d04 / 2 | `094801d585e7431c9173302e5ed78626` | `6d725070c5a85f16384900b4dc293524ba8eb4125a2f74a0a768db78ace9142d` |
+| d05 / 0 | `9fa64a65b5054451a4887bcdc8aa729c` | `0111669d7ccbeda7025699d91e2fbff8df4dfcbd03e093d7c8ecb84b524f6b46` |
+| d05 / 1 | `1eb32d441cff46c29040bfa061383c6c` | `080f4ab5bb2e14ee92840bfca77238c334bdb9ac45e6c9c306dbdfc04d32cb69` |
+| d05 / 2 | `1729e5d0029e4505a1cf285cb78dadbb` | `27af57042e8b13f3daebad3117e83ab901e06141d2c6f9f29dcabfebbb9f490f` |
+| d06 / 0 | `9e257e1d93334399a25b0722cb886d4b` | `2fd2eda0a33f7c96d27e39dee5da9a1ade35f4a1be6aedaf513acc1e4f8570e5` |
+| d06 / 1 | `c6e71e508b7b4384859e999185efbe21` | `73a5949c7d21c55c6305db57d8013b268280bcf86b6f8ffc03f9828af6348142` |
+| d06 / 2 | `5205326991de4d07a06b1457d45e9dba` | `fb11b2e8ff7b5c82f46d30bd87494d71ea63dd8686a4123eb09f14e5d8723c07` |

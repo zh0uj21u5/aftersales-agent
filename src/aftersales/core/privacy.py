@@ -4,6 +4,8 @@ import re
 
 from pydantic import JsonValue
 
+from aftersales.policy.output_guard import OUTPUT_VIOLATION_CODES
+
 _PHONE = re.compile(r"(?<!\d)(1\d{2})\d{4}(\d{4})(?!\d)")
 _FIELDS = {
     "action_id",
@@ -15,6 +17,7 @@ _FIELDS = {
     "cache_creation_tokens",
     "cache_hit",
     "cached_tokens",
+    "codes",
     "cost",
     "currency",
     "enabled",
@@ -44,6 +47,7 @@ _FIELDS = {
     "sku_id",
     "source",
     "status",
+    "step",
     "steps",
     "stop_reason",
     "tokens",
@@ -100,6 +104,7 @@ _VALUES = {
     "tool_name": _TOOLS,
     "permission": {"read", "write", "escalate"},
     "currency": {"USD"},
+    "codes": OUTPUT_VIOLATION_CODES,
     "purpose": {"agent", "confirmation", "goal_judge"},
     "role": {"user", "assistant", "tool"},
     "source": {"hook", "service", "execution", "web_button", "natural_language"},
@@ -141,6 +146,9 @@ _VALUES = {
         "allowed",
         "denied",
         "disabled",
+        "passed",
+        "retry",
+        "fallback",
     },
 }
 _LABEL = re.compile(r"[A-Za-z0-9_./:-]{1,100}")

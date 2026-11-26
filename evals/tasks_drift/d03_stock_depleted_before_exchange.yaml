@@ -1,0 +1,41 @@
+id: d03_stock_depleted_before_exchange
+tags:
+- state_drift
+- exchange
+- return
+- amount
+user_profile:
+  phone: '13800000012'
+  name: 用户012
+opening_message: 我是用户012，手机号13800000012。订单 O1012 的 OI00016 想换颜色，换成 S0052 一件。请先给我核对换货方案。如果那款缺货，就改成直接退这件，告诉我退款多少，再让我确认。
+instruction: '看到 S0052 的换货方案后明确同意。若客服说 S0052 已无库存，在它给出 OI00016 退一件的退款方案后重新明确同意。退款办妥且知道实际金额后结束。
+
+  '
+scripted_replies:
+- 好的，确认换货。
+- 好的，确认退货退款。
+- '###STOP###'
+world_events:
+- kind: set_sku_stock
+  after_turn: 1
+  sku_id: S0052
+  stock: 0
+gold_actions:
+- tool: request_return
+  args:
+    order_id: O1012
+    items:
+    - order_item_id: OI00016
+      qty: 1
+    reason: 目标颜色售罄
+amount_sources:
+- action_index: 0
+must_not:
+- modify_address
+- cancel_order
+- apply_price_protection
+- create_order
+- submit_approval
+- transfer_to_human
+must_mention:
+- '76.00'

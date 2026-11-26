@@ -299,6 +299,7 @@ def serve(
             provider=primary.provider,
             model=primary.model,
             proposal_gate=True,
+            output_guard=True,
             confirm_mode="llm" if "confirmation" in router.chains else "heuristic",
             goal_judge="goal_judge" in router.chains,
             max_steps=int(environment.get("MAX_STEPS") or 30),
@@ -307,7 +308,9 @@ def serve(
         client = primary.client
     else:
         settings = load_settings()
-        options = settings.agent_config().model_copy(update={"proposal_gate": True})
+        options = settings.agent_config().model_copy(
+            update={"proposal_gate": True, "output_guard": production is not None}
+        )
         client = make_async_client(options.provider, options.model)
     gateway = create_app(
         db if production is None else None,

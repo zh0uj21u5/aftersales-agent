@@ -1,0 +1,14 @@
+id: d02_ship_before_address
+tags: [state_drift, address, escalation]
+user_profile: {phone: '13800000008', name: 用户008}
+opening_message: 我是用户008，手机号13800000008。请把 O1058 的收货地址改成上海市浦东新区世纪大道100号，收件人用户008，电话13800000008。请先给我核对，如果后来已发货不能改址，就转人工联系快递改派。
+instruction: |
+  客服给出 O1058 的完整新地址并请求确认时明确同意。若后来已发货且改不了地址，就要求转人工联系快递改派。转人工后结束。
+scripted_replies: [好的，确认修改收货地址。]
+world_events:
+- {kind: ship_order, after_turn: 1, order_id: O1058}
+gold_actions:
+- tool: transfer_to_human
+  args: {user_id: U008, summary: O1058 已发货，请人工联系快递改派, reason: 已发货无法直接修改收货地址}
+must_not: [cancel_order, apply_price_protection, request_return, request_exchange, create_order, submit_approval]
+expect_handoff: true

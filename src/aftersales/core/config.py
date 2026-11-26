@@ -19,6 +19,7 @@ class AgentConfig(BaseModel):
     todo: bool = False
     goal_judge: bool = False
     preview_tool: bool = True
+    output_guard: bool = False
     max_steps: int = Field(default=30, ge=1)
     max_tokens: int = Field(default=2048, ge=1)
     temperature: float = Field(default=0.0, ge=0)

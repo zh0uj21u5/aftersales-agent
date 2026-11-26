@@ -10,11 +10,20 @@ from datetime import datetime
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, Protocol, get_type_hints
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, create_model
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    PrivateAttr,
+    ValidationError,
+    create_model,
+)
 
 from aftersales.core.config import AgentConfig
 from aftersales.domain.db import DbConnection
 from aftersales.domain.services import PolicyError, Services
+from aftersales.policy.output_guard import TurnToolOutcome
 
 if TYPE_CHECKING:
     from aftersales.core.context import TodoItem
@@ -68,10 +77,15 @@ class ToolSpec(BaseModel):
 
 
 class ToolResult(BaseModel):
+    _outcome: TurnToolOutcome | None = PrivateAttr(default=None)
     content: str
     is_error: bool = False
     rule_ids: list[str] = Field(default_factory=list)
     source: str | None = None
+
+    @property
+    def outcome(self) -> TurnToolOutcome | None:
+        return self._outcome
 
 
 def tool_result_message(call_id: str, result: ToolResult) -> Message:
@@ -209,6 +223,10 @@ class ToolRegistry:
         except Exception as exc:  # noqa: BLE001 - isolate arbitrary tool failures
             # Exception text may include credentials or private backend data.
             result = ToolResult(content=f"[TOOL_ERROR] {type(exc).__name__}", is_error=True)
+        if ctx.config.output_guard and not result.is_error:
+            result._outcome = TurnToolOutcome.from_result(
+                name, entry.spec.permission, result.content
+            )
         return self._bounded(result, ctx)
 
     @staticmethod

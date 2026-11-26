@@ -1,0 +1,39 @@
+id: d06_compound_partial_drift
+tags:
+- state_drift
+- compound
+- address
+- price_protection
+- amount
+user_profile:
+  phone: '13800000022'
+  name: 用户022
+opening_message: 我是用户022，手机号13800000022。请把 O1072 改送到上海市浦东新区世纪大道100号，收件人用户022，电话13800000022，再为同单
+  OI00128 办价保。两个动作请一起给我核对。如果后来发货不能改址，就只帮我办价保，不用转人工。
+instruction: '收到 O1072 的改址和价保两项方案后明确同意整份方案。若客服说明刚发货已不能改址，请在收到只含价保的新方案后明确同意。获知改址未办理和实际退差结果后结束。
+
+  '
+scripted_replies:
+- 好的，确认这两项一起办。
+- 好的，确认只办理价保。
+- '###STOP###'
+world_events:
+- kind: ship_order
+  after_turn: 1
+  order_id: O1072
+gold_actions:
+- tool: apply_price_protection
+  args:
+    order_id: O1072
+    order_item_id: OI00128
+amount_sources:
+- action_index: 0
+must_not:
+- cancel_order
+- request_return
+- request_exchange
+- create_order
+- submit_approval
+- transfer_to_human
+must_mention:
+- '60.00'

@@ -4,7 +4,17 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    SerializerFunctionWrapHandler,
+    model_serializer,
+    model_validator,
+)
+
+from evals.world import WorldEvent
 
 ActionName = Literal[
     "modify_address",
@@ -51,6 +61,16 @@ class EvalTask(BaseModel):
     must_mention: list[str] = Field(default_factory=list)
     must_not: list[str] = Field(default_factory=list)
     expect_handoff: bool = False
+    world_events: list[WorldEvent] = Field(default_factory=list)
+
+    @model_serializer(mode="wrap")
+    def omit_empty_world_events(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, JsonValue]:
+        data = handler(self)
+        if not self.world_events:
+            data.pop("world_events", None)
+        return data
 
     @model_validator(mode="after")
     def validate_sources(self) -> "EvalTask":

@@ -97,6 +97,11 @@ class PgTraceSink:
             ids = safe.get("rule_ids") or (["P02"] if event == "confirm_verdict" else ["unknown"])
             for rule in ids:
                 self.telemetry.denials.add(1, {"gate": event, "rule": str(rule)})
+        elif event == "output_guard" and safe.get("allowed") is False:
+            codes = safe.get("codes")
+            if isinstance(codes, list):
+                for code in codes:
+                    self.telemetry.denials.add(1, {"gate": event, "rule": str(code)})
 
     def close(self, reason: str = "completed") -> None:
         if not self._closed:

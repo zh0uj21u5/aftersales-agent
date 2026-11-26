@@ -30,6 +30,7 @@ from evals.scripted import ScriptedUser
 from evals.simulator import MAX_TURNS, LLMUser, SimulatorError
 from evals.state import normalize_state, seed_anchors
 from evals.taxonomy import ViolationRecord
+from evals.world import WorldEventConflict, apply_world_event
 
 
 class TrialResult(BaseModel):
@@ -188,6 +189,15 @@ def run_trial(
             if session.closed or result.stop_reason in {"error", "max_steps"}:
                 stop_reason = result.stop_reason
                 break
+            if turns < limit:
+                for event in task.world_events:
+                    if event.after_turn == turns:
+                        applied = True
+                        try:
+                            apply_world_event(actual, clock, event)
+                        except WorldEventConflict:
+                            applied = False
+                        writer.emit("world_event", applied=applied, **event.model_dump(mode="json"))
         latency_ms = (time.perf_counter_ns() - started) // 1_000_000
         writer.close(stop_reason)
         events = read_trace(writer.path)
@@ -429,6 +439,14 @@ def report_markdown(report: EvalReport) -> str:
     return "\n".join(lines)
 
 
+def dataset_sha256(tasks: list[EvalTask]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            [task.model_dump() for task in tasks], sort_keys=True, ensure_ascii=False
+        ).encode()
+    ).hexdigest()
+
+
 def run_suite(
     tasks: list[EvalTask],
     llm: LLMClient,
@@ -461,9 +479,7 @@ def run_suite(
                 raise ValueError(f"{task.id} 金额期望过时，请运行 scripts/gen_expectations.py")
         finally:
             db.close()
-    dataset = hashlib.sha256(
-        json.dumps([t.model_dump() for t in tasks], sort_keys=True, ensure_ascii=False).encode()
-    ).hexdigest()
+    dataset = dataset_sha256(tasks)
     source = hashlib.sha256()
     root = Path(__file__).resolve().parents[1]
     sources = [

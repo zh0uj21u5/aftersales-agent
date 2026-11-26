@@ -1,0 +1,38 @@
+id: d04_price_changed_before_protect
+tags:
+- state_drift
+- price_protection
+- amount
+user_profile:
+  phone: '13800000008'
+  name: 用户008
+opening_message: 我是用户008，手机号13800000008。看到 O1058 的 OI00101 降价了，请帮我申请价保，先告诉我这件能退多少再确认。
+instruction: '只办这件商品的价保。在客服明确展示价保方案后同意。如果客服随后发现商品又调价，请在看到新的、仍有退差的金额方案后重新同意。获知实际退差结果后结束。
+
+  '
+scripted_replies:
+- 好的，确认办理这个价保。
+- 好的，确认按新试算金额办理。
+- '###STOP###'
+world_events:
+- kind: set_sku_price
+  after_turn: 1
+  sku_id: S0049
+  price_cents: 5600
+gold_actions:
+- tool: apply_price_protection
+  args:
+    order_id: O1058
+    order_item_id: OI00101
+amount_sources:
+- action_index: 0
+must_not:
+- modify_address
+- cancel_order
+- request_return
+- request_exchange
+- create_order
+- submit_approval
+- transfer_to_human
+must_mention:
+- '20.00'

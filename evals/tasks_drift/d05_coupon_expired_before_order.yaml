@@ -1,0 +1,42 @@
+id: d05_coupon_expired_before_order
+tags:
+- state_drift
+- create_order
+- coupon
+- amount
+user_profile:
+  phone: '13800000012'
+  name: 用户012
+opening_message: 我是用户012，手机号13800000012。我要买 S0085 两件，用 UC0023 优惠券、PM0012 支付、默认地址。请先让我核对实付方案。如果这张券失效了，就不用任何券按原价买，告诉我无券金额再让我确认。
+instruction: '对包含指定券的两件商品方案明确同意。客服若发现该券已失效，对保留原商品、数量、支付方式和地址的新无券方案重新同意。获知下单结果和实际支付金额后结束。
+
+  '
+scripted_replies:
+- 好的，确认使用这张券下单。
+- 好的，确认不用券按新金额下单。
+- '###STOP###'
+world_events:
+- kind: set_coupon_status
+  after_turn: 1
+  user_coupon_id: UC0023
+  status: expired
+gold_actions:
+- tool: create_order
+  args:
+    user_id: U012
+    items:
+    - sku_id: S0085
+      qty: 2
+    payment_method_id: PM0012
+amount_sources:
+- action_index: 0
+must_not:
+- modify_address
+- cancel_order
+- apply_price_protection
+- request_return
+- request_exchange
+- submit_approval
+- transfer_to_human
+must_mention:
+- '262.00'

@@ -37,6 +37,7 @@ jobs:
         run: |
           python scripts/gen_expectations.py --check
           python scripts/gen_expectations.py --tasks evals/tasks_v2 --check
+          python scripts/gen_expectations.py --tasks evals/tasks_drift --check
 
       - name: Run offline end-to-end demo script
         run: |

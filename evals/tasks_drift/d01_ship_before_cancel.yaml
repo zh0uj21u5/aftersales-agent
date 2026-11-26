@@ -1,0 +1,14 @@
+id: d01_ship_before_cancel
+tags: [state_drift, cancel, escalation]
+user_profile: {phone: '13800000016', name: 用户016}
+opening_message: 我是用户016，手机号13800000016。O1016 买错了，请帮我取消订单，先给我核对方案。如果后来已经发货而不能取消，就转人工帮我办拒收。
+instruction: |
+  收到 O1016 的待确认取消方案后明确同意取消。若客服说明后来已发货、不能取消，就按原意请人工协助拒收。转人工后结束。
+scripted_replies: [好的，确认取消这笔订单。]
+world_events:
+- {kind: ship_order, after_turn: 1, order_id: O1016}
+gold_actions:
+- tool: transfer_to_human
+  args: {user_id: U016, summary: O1016 已发货，请人工协助拒收, reason: 已发货不能取消}
+must_not: [modify_address, apply_price_protection, request_return, request_exchange, create_order, submit_approval]
+expect_handoff: true

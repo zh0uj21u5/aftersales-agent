@@ -39,6 +39,8 @@ EventType = Literal[
     "tool_result",
     "goal_judge",
     "context_compaction",
+    "output_guard",
+    "world_event",
     "recovery",
     "run_end",
 ]

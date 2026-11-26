@@ -10,7 +10,7 @@
 |---|---|---|
 | v1 · 规则与评测 | Guard 与确认门约束写操作。双库分别记录 Agent 实际执行与 Gold 动作重放，以业务终态判分。 | P7-A Flash 固定 8 题各运行 3 次，`pass^1` 83.33%，`pass^3` 62.50%。 |
 | v2 · 授权与审计 | 服务端 Proposal 绑定身份、版本、参数和业务前提。SQLite 单事务提交业务写入、幂等记录和会话检查点。双栏工作台展示实况与回放。 | 60 题 C 组 `pass^1` 96.67%，终态正确率 99.44%，成功写入中未确认操作 0 次。 |
-| v3 · 生产执行 | 异步 SSE、PostgreSQL 行锁与账本触发器、Redis 租约与用户配额、JWT 归属校验与脱敏、Transactional Outbox、自动勾稽对账、多模型熔断及主管审批。 | 867 项离线测试通过，两端各 18 项真实 PostgreSQL/Redis 集成通过。68 题金额重放零差异。 |
+| v3 · 生产执行与状态漂移防护 | 异步 SSE、PostgreSQL 行锁与账本触发器、Redis 租约与用户配额、JWT 归属校验与脱敏、Transactional Outbox、自动勾稽对账、多模型熔断、主管审批、确定性输出绊线（Output Tripwire）与动态状态突变评测。 | 921 项离线测试通过，两端各 18 项真实 PostgreSQL/Redis 集成通过，74 题金额重放零差异；动态状态漂移 18 会话终态正确率 94.44%，快照漂移拦截 16 次。 |
 
 [版本架构](docs/ARCHITECTURE.md) · [历史模型实验](docs/RESULTS.md) · [v3 生产架构细节](docs/ARCHITECTURE.md#m8m10--v3-生产执行)
 
@@ -139,7 +139,7 @@ python -c "import sys; assert sys.version_info[:2] == (3, 11), '需要 Python 3.
 python -m venv .venv
 .venv\Scripts\python.exe -m pip install -e ".[dev]" -i https://pypi.tuna.tsinghua.edu.cn/simple
 
-# 无需 .env 即可运行离线演示、867 项测试及两套共 68 题的金额重放校验
+# 无需 .env 即可运行离线演示、921 项测试及三套共 74 题的金额重放校验
 .venv\Scripts\aftersales.exe --help
 .venv\Scripts\python.exe scripts/demo.py
 .venv\Scripts\python.exe -m pytest -q
@@ -147,6 +147,7 @@ python -m venv .venv
 .venv\Scripts\python.exe -m ruff format --check src tests evals scripts
 .venv\Scripts\python.exe scripts/gen_expectations.py --check
 .venv\Scripts\python.exe scripts/gen_expectations.py --tasks evals/tasks_v2 --check
+.venv\Scripts\python.exe scripts/gen_expectations.py --tasks evals/tasks_drift --check
 ```
 
 ### 2. 连接真实模型体验 CLI 对话、Trace 渲染与小样本评测
@@ -185,6 +186,7 @@ M10 的异步退款和履约通过配置的渠道适配服务执行。已有 M9 
 - **异步并发**。10 个独立会话各等待模拟模型 0.3 秒，总耗时 0.560 秒。同一会话争用返回 `409`，模型等待期间归还数据库连接。 [异步回合实现](src/aftersales/core/loop.py)
 - **交易一致性**。单件库存的 20 路抢单仅 1 笔成功。用券、价保、退货的 10 路争用各 1 笔成功。40 笔交叉 SKU 订单全部提交，零死锁。 [PG 账本 Schema](src/aftersales/domain/pg_schema.sql) · [增量迁移 v2](src/aftersales/domain/pg_migration_2.sql)
 - **退款与审批**。60 操作、20 路并发的混合故障压测，Linux Compose 的端到端 P50 为 98.98 ms，P95 为 618.74 ms（优化前基线 P95 为 1061.97 ms）。三次渠道尝试只产生一笔 ¥450.00 退款，零死信。首笔审批由 21 条应用 SQL 降至 11 条（预热稳态业务 SQL 合计约 11.8 ms），保留事务前后快照与 `synchronous_commit=on`。 [混合压测脚本](scripts/load_test.py) · [持久性架构说明](docs/ARCHITECTURE.md#v3-封版验证与持久性边界)
+- **输出绊线与动态状态漂移**。生产网关默认开启确定性输出合规绊线（拦截异步处理中/待审批误报已到账、越权赔付承诺与内部标记直出，支持 SSE 预览撤回、单次打回重写与安全兜底）。仿 $\tau^2$-bench 注入跨轮次外部发货、售罄、调价与券失效事件，18 个独立会话（6 题 × 3）实测快照漂移拦截 16 次、未确认写入 0 次、双库终态正确率 94.44%（17/18）。 [输出绊线实现](src/aftersales/policy/output_guard.py) · [动态环境执行器](evals/world.py) · [动态漂移实测](docs/RESULTS.md#m11-动态状态漂移实测)
 
 可用 `LLM_ROUTING_CONFIG` 指向 YAML 文件。按需配置三类用途，列表顺序决定主备。密钥从 `key_env` 指定的环境变量读取。
 
@@ -204,15 +206,15 @@ goal_judge:
 src/aftersales/
   cli.py             CLI 入口：seed / chat / trace / eval / serve / reconcile
   core/              异步循环 / Proposal 执行 / 会话与 Trace / Redis 协调 / Outbox / 模型熔断
-  policy/            POLICY.md（P01～P15） / guard.py / proposal.py / proposal_text.py / confirmation.py
+  policy/            POLICY.md（P01～P15） / guard.py / proposal.py / confirmation.py / output_guard.py
   tools/             registry / auth / query / write / escalate / proposal
   domain/            规则与金额 / SQLite 与 PostgreSQL / 增量迁移 / 渠道与对账
   prompts/           system.md / proposal.md
   web/               FastAPI / SSE / JWT / 支付回调 / 主管审批 / 离线工作台
-configs/             baseline / guard_only / guard / on_demand / todo / goal_judge / full / proposal / proposal_llm
-evals/               tasks（60 题） / tasks_v2（8 题） / 模拟器 / 双库判分与审计
+configs/             baseline / guard_only / guard / on_demand / todo / goal_judge / full / proposal / proposal_llm / output_guard
+evals/               tasks（60 题） / tasks_v2（8 题） / tasks_drift（6 题） / world.py / 模拟器 / 双库判分与审计
 scripts/             demo.py / gen_expectations.py / load_test.py / 实验运行与复核
-tests/               867 项默认离线测试 / 18 项 PostgreSQL 与 Redis 集成测试 / LLM 冒烟
+tests/               921 项默认离线测试 / 18 项 PostgreSQL 与 Redis 集成测试 / LLM 冒烟
 docs/                产品需求、系统架构与实验报告
 ```
 
